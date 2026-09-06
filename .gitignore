@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# generated, rebuild with: python src/main.py seed
+data/*.db
+data/*.db-wal
+data/*.db-shm
