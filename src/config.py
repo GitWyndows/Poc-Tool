@@ -1,43 +1,25 @@
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "poc_tool.db"
+# Built from this file's location, so the CSV is found whichever folder the scripts are run from.
+DATA_FILE = Path(__file__).resolve().parents[1] / "data" / "readings.csv"
 
-# ---------------------------------------------------------------------------
-# PLACEHOLDER STATIONS -- NOT AGREED. Do not cite these anywhere.
-#
-# Invented names at plausible Perth Hills coordinates, here so the pipeline
-# can be built and tested before the team settles on a real catchment.
-# Nothing in the code depends on which stations these are: it only needs an
-# id, a type and a lat/lon. Replacing this list is a one-commit change, and
-# neighbour distances recompute themselves because they are derived from
-# coordinates rather than hardcoded.
-#
-# Criteria for the real set, when we choose it:
-#   1. ONE catchment, or a small contiguous area. The detection rules
-#      compare each gauge against its neighbours, which only works if
-#      those gauges see broadly the same weather. Stations scattered
-#      across the state have no relationship to compare against.
-#   2. At least 5 rainfall and 3 river gauges. With three of a type you can
-#      take a median of two neighbours; with fewer, one compromised gauge
-#      is half the comparison group.
-#   3. Overlapping coverage; all stations need data across the same
-#      90-day window.
-#
-# Sources: BoM Climate Data Online (rainfall), DWER Water Information
-# Reporting (river level), data.wa.gov.au (station locations).
-# ---------------------------------------------------------------------------
-
-# (id, name, type, lat, lon)
-STATIONS = [
-    ("R1", "Placeholder rainfall 1", "rainfall", -31.9560, 116.1640),
-    ("R2", "Placeholder rainfall 2", "rainfall", -31.9010, 116.2050),
-    ("R3", "Placeholder rainfall 3", "rainfall", -31.8580, 116.2610),
-    ("R4", "Placeholder rainfall 4", "rainfall", -31.9720, 116.0580),
-    ("R5", "Placeholder rainfall 5", "rainfall", -32.0100, 116.1290),
-    ("W1", "Placeholder river 1",    "river",    -31.9450, 116.1990),
-    ("W2", "Placeholder river 2",    "river",    -31.9210, 116.2530),
-    ("W3", "Placeholder river 3",    "river",    -31.9880, 116.0900),
+# Each (id, name) sensor measures both rainfall and river level. Names are placeholders until the team picks real stations.
+SENSORS = [
+    ("S1", "Placeholder sensor 1"),
+    ("S2", "Placeholder sensor 2"),
+    ("S3", "Placeholder sensor 3"),
+    ("S4", "Placeholder sensor 4"),
+    ("S5", "Placeholder sensor 5"),
+    ("S6", "Placeholder sensor 6"),
+    ("S7", "Placeholder sensor 7"),
+    ("S8", "Placeholder sensor 8"),
 ]
 
-# Number of nearest same-type stations each gauge is compared against.
-N_NEIGHBOURS = 3
+# June to August covers Perth's wet season, where drought shows up as a drier-than-normal winter.
+START_DATE = "2026-06-01"
+
+# Matches the roughly 90-day replay window in the project proposal.
+NUM_DAYS = 90
+
+# A fixed seed means everyone generates the same data, so test results can be compared.
+RANDOM_SEED = 42
