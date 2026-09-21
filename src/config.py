@@ -30,3 +30,10 @@ ATTACKS = [
     {"sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
     {"sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
 ]
+
+# Rainfall is flagged when it differs from the other sensors by more than 10 mm AND by more than 75% of their median.
+RAIN_ALERT_MM = 10.0
+RAIN_ALERT_RATIO = 0.75
+
+# A river level is flagged when its daily change differs from the other sensors' by more than 0.5 m.
+LEVEL_ALERT_M = 0.5

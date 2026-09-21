@@ -5,6 +5,8 @@
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
     python src/main.py --attack        # apply the attacks planned in config.py
 
+Detection always runs, and a score is printed at the end.
+
 Run generate_data.py first if data/readings.csv doesn't exist.
 """
 import argparse
@@ -14,6 +16,7 @@ import time
 
 import config
 from attacks import Attacker
+from detection import Detector
 from sensor import Sensor
 
 
@@ -46,22 +49,37 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
-def print_day(day_number, date, sensors, attacker):
+def print_day(day_number, date, sensors, attacker, detector):
+    # Every reading passes through the attacker first, just as tampering in transit would.
+    readings = {s.id: attacker.apply(s.id, date, s.read(date)) for s in sensors}
+
+    # The detector sees only what a defender would: the readings, never the attack log.
+    alerts = detector.check_day(date, readings)
+    flagged = {a["sensor"] for a in alerts}
+
     # Fixed column widths keep the table lined up however long each value is.
     print(f"\nDay {day_number}  |  {date}")
     print(f"{'Sensor':<8}{'Name':<24}{'Rainfall (mm)':>15}{'River level (m)':>18}")
     print("-" * 65)
 
     for s in sensors:
-        # The attacker sits between the sensor and the output, just as tampering in transit would.
-        reading = attacker.apply(s.id, date, s.read(date))
+        reading = readings[s.id]
+
+        # Plain ASCII, since some Windows terminals can't print symbols like a warning sign.
+        mark = "  <-- ALERT" if s.id in flagged else ""
 
         # A gap is shown rather than skipped, so a silent sensor is visible in the output.
         if reading is None:
-            print(f"{s.id:<8}{s.name:<24}{'no data':>15}{'no data':>18}")
+            print(f"{s.id:<8}{s.name:<24}{'no data':>15}{'no data':>18}{mark}")
         else:
             rain, level = reading
-            print(f"{s.id:<8}{s.name:<24}{rain:>15.1f}{level:>18.2f}")
+            print(f"{s.id:<8}{s.name:<24}{rain:>15.1f}{level:>18.2f}{mark}")
+
+    # Reasons go under the table so the columns stay aligned.
+    for a in alerts:
+        print(f"  ALERT  {a['sensor']} {a['field']}: {a['reason']}")
+
+    return alerts
 
 
 def print_attack_log(attacker, all_dates, shown_dates):
@@ -87,6 +105,29 @@ def print_attack_log(attacker, all_dates, shown_dates):
             print(f"Skipped: attack on {a['sensor']} for {a['date']} falls outside the days shown.")
 
 
+def print_score(alerts, attacker):
+    # Matching on date, sensor and field means flagging the right sensor for the wrong reason isn't counted as a catch.
+    alert_keys = {(a["date"], a["sensor"], a["field"]) for a in alerts}
+    attack_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
+
+    caught = attack_keys & alert_keys
+    missed = attack_keys - alert_keys
+    false_alarms = alert_keys - attack_keys
+
+    print("\n" + "=" * 65)
+    print("DETECTION SCORE")
+    print("=" * 65)
+    print(f"Attacks caught:  {len(caught)} of {len(attack_keys)}")
+    print(f"Attacks missed:  {len(missed)}")
+    print(f"False alarms:    {len(false_alarms)}")
+
+    # Listing them by name shows exactly where a rule needs work.
+    for date, sensor, field in sorted(missed):
+        print(f"  MISSED       {date}  {sensor}  {field}")
+    for date, sensor, field in sorted(false_alarms):
+        print(f"  FALSE ALARM  {date}  {sensor}  {field}")
+
+
 def main():
     # argparse handles the options and builds the --help message for free.
     parser = argparse.ArgumentParser(description="Print simulated sensor readings.")
@@ -99,13 +140,15 @@ def main():
 
     # Attacks are opt-in so a clean run is always available to compare against.
     attacker = Attacker(config.ATTACKS if args.attack else [])
+    detector = Detector()
+    all_alerts = []
 
     # Note that --days 0 counts as not set, so it shows every day.
     shown_dates = dates[:args.days] if args.days else dates
 
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
     for i, date in enumerate(shown_dates, start=1):
-        print_day(i, date, sensors, attacker)
+        all_alerts += print_day(i, date, sensors, attacker, detector)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:
@@ -113,6 +156,8 @@ def main():
 
     if args.attack:
         print_attack_log(attacker, dates, shown_dates)
+
+    print_score(all_alerts, attacker)
 
 
 # Runs only when the file is executed directly rather than imported.
