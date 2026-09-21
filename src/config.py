@@ -23,3 +23,10 @@ NUM_DAYS = 90
 
 # A fixed seed means everyone generates the same data, so test results can be compared.
 RANDOM_SEED = 42
+
+# Planned false data injections, only used with --attack. Rainfall spikes are placed on dry days so the fake value clearly disagrees with the other sensors.
+ATTACKS = [
+    {"sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
+    {"sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
+    {"sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
+]
