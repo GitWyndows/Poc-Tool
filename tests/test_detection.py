@@ -1,4 +1,5 @@
 """Tests for detection.py, using small hand-made days instead of the CSV."""
+import config
 
 from detection import Detector
 
@@ -101,3 +102,61 @@ def test_too_few_sensors_means_no_checks():
     # With fewer than three others to compare against, a single bad sensor could fool the median.
     readings = {"S1": (0.0, 1.0), "S2": (0.0, 1.0), "S3": (80.0, 1.0)}
     assert Detector().check_day("d1", readings) == []
+
+
+# Flatline
+
+def run_days(detector, days):
+    """Feed several days through one detector and return every alert raised."""
+    alerts = []
+    for i, readings in enumerate(days):
+        alerts += detector.check_day(f"d{i + 1}", readings)
+    return alerts
+
+
+def test_stuck_river_gauge_is_flagged_on_the_fourth_day():
+    # The other rivers fall 5 cm a day while S7 stays at 2.00.
+    days = [day(0.0, level=2.0 - 0.05 * i, S7=(0.0, 2.0)) for i in range(config.FLATLINE_DAYS)]
+    alerts = run_days(Detector(), days)
+
+    assert flagged(alerts) == {("S7", "river_level_m")}
+    assert alerts[0]["date"] == f"d{config.FLATLINE_DAYS}"
+
+
+def test_stuck_sensor_is_only_flagged_once():
+    days = [day(0.0, level=2.0 - 0.05 * i, S7=(0.0, 2.0)) for i in range(8)]
+    alerts = run_days(Detector(), days)
+
+    assert len(alerts) == 1
+
+
+def test_whole_area_dry_week_is_not_a_flatline():
+    # Every gauge reading 0 mm for a week is just a dry week.
+    alerts = run_days(Detector(), [day(0.0, level=1.0 - 0.05 * i) for i in range(6)])
+    assert alerts == []
+
+
+def test_drizzle_in_other_sensors_does_not_count_as_moving():
+    # 0.1 mm differences are gauge noise, not a sign that S1 is stuck.
+    days = [day(0.0, level=1.0 - 0.05 * i) for i in range(3)]
+    days.append(day(0.1, level=0.85, S1=(0.0, 0.85)))
+    assert run_days(Detector(), days) == []
+
+
+def test_stuck_rain_gauge_during_rain_is_flagged():
+    # Others get varied rain while S2 keeps reporting 3.0 mm.
+    rain = [2.0, 6.0, 4.0, 9.0]
+    days = [day(r, level=1.0 + 0.05 * i, S2=(3.0, 1.0 + 0.05 * i)) for i, r in enumerate(rain)]
+    alerts = run_days(Detector(), days)
+
+    assert ("S2", "rainfall_mm") in flagged(alerts)
+
+
+def test_stuck_gauge_snapping_back_is_not_a_river_jump():
+    # S7 is frozen at 2.00 while the others fall, then drops 0.75 m back to its real level.
+    days = [day(0.0, level=2.0 - 0.15 * i, S7=(0.0, 2.0)) for i in range(5)]
+    days.append(day(0.0, level=1.25, S7=(0.0, 1.25)))
+    alerts = run_days(Detector(), days)
+
+    assert [a["field"] for a in alerts] == ["river_level_m"]
+    assert "stuck" in alerts[0]["reason"]
