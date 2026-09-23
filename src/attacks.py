@@ -1,9 +1,9 @@
-"""Attacks on sensor data: single-day spikes and multi-day flatlines, with every change logged."""
+"""Attacks on sensor data: single-day spikes, multi-day flatlines and slow drift, with every change logged."""
 from datetime import date, timedelta
 
 # The two values a reading holds, in the order Sensor.read() returns them.
 FIELDS = ("rainfall_mm", "river_level_m")
-TYPES = ("spike", "flatline")
+TYPES = ("spike", "flatline", "drift")
 
 
 def attack_dates(attack):
@@ -15,11 +15,20 @@ def attack_dates(attack):
     return [(start + timedelta(days=i)).isoformat() for i in range(attack["days"])]
 
 
+def day_after(attack):
+    """The first date after an attack ends, when a tampered sensor snaps back to its real value."""
+    last = date.fromisoformat(attack_dates(attack)[-1])
+    return (last + timedelta(days=1)).isoformat()
+
+
 def describe(attack):
     """A short plain-English summary of an attack, for printing."""
     if attack["type"] == "spike":
         return f"spike on {attack['sensor']} {attack['field']} on {attack['date']}"
     dates = attack_dates(attack)
+    if attack["type"] == "drift":
+        return (f"drift on {attack['sensor']} {attack['field']} of {attack['rate']:+.2f} a day "
+                f"from {dates[0]} to {dates[-1]}")
     return f"flatline on {attack['sensor']} {attack['field']} from {dates[0]} to {dates[-1]}"
 
 
@@ -31,6 +40,10 @@ class Attacker:
                 raise ValueError(f"Unknown attack type '{attack.get('type')}'. Use one of {TYPES}.")
             if attack["field"] not in FIELDS:
                 raise ValueError(f"Unknown field '{attack['field']}' in attack plan. Use one of {FIELDS}.")
+
+            # Rain arrives as separate daily amounts, so a slow creep only makes sense for river level.
+            if attack["type"] == "drift" and attack["field"] != "river_level_m":
+                raise ValueError("Drift attacks only work on river_level_m.")
 
         self.plan = plan
 
@@ -64,6 +77,10 @@ class Attacker:
 
             if attack["type"] == "spike":
                 values[i] = attack["value"]
+            elif attack["type"] == "drift":
+                # The offset grows by the same amount each day, so no single day looks unusual.
+                day_number = attack_dates(attack).index(date) + 1
+                values[i] = round(real_value + attack["rate"] * day_number, 2)
             else:
                 # A stuck sensor keeps repeating whatever it last reported before it froze.
                 self.frozen.setdefault(attack_id, real_value)

@@ -15,7 +15,7 @@ import sys
 import time
 
 import config
-from attacks import Attacker, attack_dates, describe
+from attacks import Attacker, attack_dates, day_after, describe
 from detection import Detector
 from sensor import Sensor
 
@@ -91,7 +91,7 @@ def print_attack_log(attacker, all_dates, shown_dates):
     if not attacker.log:
         print("No attacks were applied.")
 
-    # Grouped by attack, so a week-long flatline reads as one entry rather than seven.
+    # Grouped by attack, so a week long flatline reads as one entry rather than seven.
     for attack_id, attack in enumerate(attacker.plan):
         entries = [e for e in attacker.log if e["attack"] == attack_id]
         if not entries:
@@ -99,8 +99,11 @@ def print_attack_log(attacker, all_dates, shown_dates):
 
         unit = "mm" if attack["field"] == "rainfall_mm" else "m"
         first = entries[0]
+        last = entries[-1]
         if attack["type"] == "spike":
             detail = f"real {first['real']:.2f} {unit} -> fake {first['fake']:.2f} {unit}"
+        elif attack["type"] == "drift":
+            detail = f"{last['fake'] - last['real']:+.2f} {unit} off by the last day"
         else:
             detail = f"frozen at {first['fake']:.2f} {unit} for {len(entries)} days"
         print(f"{describe(attack)}: {detail}")
@@ -116,26 +119,39 @@ def print_attack_log(attacker, all_dates, shown_dates):
 
 
 def print_score(alerts, attacker):
-    # An attack counts as caught if any alert matches its sensor and field on a day it was active.
-    attacked_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
     alert_keys = {(a["date"], a["sensor"], a["field"]) for a in alerts}
+    attacked_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
+
+    # An alert the day an attack stops, on that sensor, is caused by the snapback rather than being false.
+    end_keys = {(day_after(attacker.plan[e["attack"]]), e["sensor"], e["field"]) for e in attacker.log}
 
     ran = sorted({e["attack"] for e in attacker.log})
-    caught, missed = [], []
+    caught, caught_late, missed = [], [], []
     for attack_id in ran:
+        attack = attacker.plan[attack_id]
         keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log if e["attack"] == attack_id}
-        (caught if keys & alert_keys else missed).append(attacker.plan[attack_id])
 
-    false_alarms = alert_keys - attacked_keys
+        # Caught means an alert on the right sensor and field while the attack was running.
+        if keys & alert_keys:
+            caught.append(attack)
+        elif (day_after(attack), attack["sensor"], attack["field"]) in alert_keys:
+            caught_late.append(attack)
+        else:
+            missed.append(attack)
+
+    false_alarms = alert_keys - attacked_keys - end_keys
 
     print("\n" + "=" * 65)
     print("DETECTION SCORE")
     print("=" * 65)
     print(f"Attacks caught:  {len(caught)} of {len(ran)}")
+    print(f"Caught late:     {len(caught_late)}  (only noticed when the attack stopped)")
     print(f"Attacks missed:  {len(missed)}")
     print(f"False alarms:    {len(false_alarms)}")
 
     # Listing them by name shows exactly where a rule needs work.
+    for attack in caught_late:
+        print(f"  LATE         {describe(attack)}")
     for attack in missed:
         print(f"  MISSED       {describe(attack)}")
     for date, sensor, field in sorted(false_alarms):

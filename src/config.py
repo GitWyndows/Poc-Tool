@@ -1,3 +1,4 @@
+"""Settings shared by every script, so a change here applies everywhere."""
 from pathlib import Path
 
 # Built from this file's location, so the CSV is found whichever folder the scripts are run from.
@@ -24,12 +25,13 @@ NUM_DAYS = 90
 # A fixed seed means everyone generates the same data, so test results can be compared.
 RANDOM_SEED = 42
 
-# Planned attacks, only used with --attack. Spikes fake one day and flatlines freeze a sensor on its first day value.
+# Planned attacks, only used with --attack. Spikes fake one day, flatlines freeze a sensor, and drift adds a little more each day.
 ATTACKS = [
     {"type": "spike", "sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
     {"type": "spike", "sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
     {"type": "spike", "sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
     {"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 7, "field": "river_level_m"},
+    {"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06},
 ]
 
 # Rainfall is flagged when it differs from the other sensors by more than 10 mm AND by more than 75% of their median.
@@ -44,3 +46,13 @@ FLATLINE_DAYS = 4
 
 # Other sensors only count as moving if they changed by at least this much, so drizzle or 1 cm wobbles don't count.
 FLATLINE_MIN_MOVE = {"rainfall_mm": 1.0, "river_level_m": 0.05}
+
+# Drift is measured over this many days of small gaps between a sensor and the others.
+DRIFT_DAYS = 10
+
+# Daily gaps bigger than this are one-off steps rather than creep, so they're left out of the drift total.
+DRIFT_MAX_STEP = 0.2
+
+# The drift limit starts at 0.3 m and grows by a quarter of how far the rivers moved in that time.
+DRIFT_ALERT_M = 0.3
+DRIFT_ALERT_RATIO = 0.25
