@@ -71,16 +71,16 @@ def test_print_day_marks_the_flagged_sensor(data_file, capsys):
 
 def test_score_counts_caught_missed_and_false_alarms(capsys):
     attacker = Attacker([
-        {"type": "spike", "sensor": "S1", "date": "d1", "field": "rainfall_mm", "value": 50.0},
-        {"type": "spike", "sensor": "S2", "date": "d2", "field": "rainfall_mm", "value": 50.0},
+        {"type": "spike", "sensor": "S1", "date": "2026-06-01", "field": "rainfall_mm", "value": 50.0},
+        {"type": "spike", "sensor": "S2", "date": "2026-06-02", "field": "rainfall_mm", "value": 50.0},
     ])
-    attacker.apply("S1", "d1", (0.0, 1.0))
-    attacker.apply("S2", "d2", (0.0, 1.0))
+    attacker.apply("S1", "2026-06-01", (0.0, 1.0))
+    attacker.apply("S2", "2026-06-02", (0.0, 1.0))
 
     # One real catch, and one alert on a sensor that was never attacked.
     alerts = [
-        {"date": "d1", "sensor": "S1", "field": "rainfall_mm"},
-        {"date": "d3", "sensor": "S4", "field": "rainfall_mm"},
+        {"date": "2026-06-01", "sensor": "S1", "field": "rainfall_mm"},
+        {"date": "2026-06-05", "sensor": "S4", "field": "rainfall_mm"},
     ]
     main.print_score(alerts, attacker)
     out = capsys.readouterr().out
@@ -91,11 +91,25 @@ def test_score_counts_caught_missed_and_false_alarms(capsys):
 
 
 def test_right_sensor_wrong_field_is_not_a_catch(capsys):
-    attacker = Attacker([{"type": "spike", "sensor": "S1", "date": "d1", "field": "rainfall_mm", "value": 50.0}])
-    attacker.apply("S1", "d1", (0.0, 1.0))
+    attacker = Attacker([{"type": "spike", "sensor": "S1", "date": "2026-06-01", "field": "rainfall_mm", "value": 50.0}])
+    attacker.apply("S1", "2026-06-01", (0.0, 1.0))
 
-    main.print_score([{"date": "d1", "sensor": "S1", "field": "river_level_m"}], attacker)
+    main.print_score([{"date": "2026-06-01", "sensor": "S1", "field": "river_level_m"}], attacker)
     assert "Attacks caught:  0 of 1" in capsys.readouterr().out
+
+
+def test_alert_the_day_an_attack_stops_counts_as_late_not_false(capsys):
+    plan = [{"type": "drift", "sensor": "S2", "start": "2026-07-01", "days": 3, "field": "river_level_m", "rate": 0.05}]
+    attacker = Attacker(plan)
+    for d in ["2026-07-01", "2026-07-02", "2026-07-03"]:
+        attacker.apply("S2", d, (0.0, 1.0))
+
+    main.print_score([{"date": "2026-07-04", "sensor": "S2", "field": "river_level_m"}], attacker)
+    out = capsys.readouterr().out
+
+    assert "Attacks caught:  0 of 1" in out
+    assert "Caught late:     1" in out
+    assert "False alarms:    0" in out
 
 
 # Full runs
@@ -135,5 +149,14 @@ def test_flatline_counts_as_one_caught_attack(data_file, monkeypatch, capsys):
 
     out = run(monkeypatch, capsys, "--attack")
     assert "frozen at 2.68 m for 7 days" in out
+    assert "Attacks caught:  1 of 1" in out
+    assert "False alarms:    0" in out
+
+
+def test_drift_is_caught_while_it_runs(data_file, monkeypatch, capsys):
+    plan = [{"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06}]
+    monkeypatch.setattr(config, "ATTACKS", plan)
+
+    out = run(monkeypatch, capsys, "--attack")
     assert "Attacks caught:  1 of 1" in out
     assert "False alarms:    0" in out

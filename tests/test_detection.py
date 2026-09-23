@@ -160,3 +160,64 @@ def test_stuck_gauge_snapping_back_is_not_a_river_jump():
 
     assert [a["field"] for a in alerts] == ["river_level_m"]
     assert "stuck" in alerts[0]["reason"]
+
+
+# Drift
+
+def drifting_days(total, rate, start=2, others_fall=0.02, **extra):
+    """Others fall steadily while S2 creeps away by `rate` a day from day `start` onwards."""
+    days = []
+    for i in range(total):
+        base = 2.0 - others_fall * i
+        offset = rate * max(0, i - start + 1)
+        days.append(day(0.0, level=round(base, 2), S2=(0.0, round(base + offset, 2)), **extra))
+    return days
+
+
+def test_steady_drift_is_flagged_once():
+    alerts = run_days(Detector(), drifting_days(14, 0.06))
+
+    assert [(a["sensor"], a["field"]) for a in alerts] == [("S2", "river_level_m")]
+    assert "drifted" in alerts[0]["reason"]
+
+
+def test_drift_is_too_small_for_the_daily_jump_rule():
+    # Each day's step is only 0.06 m, far below the 0.5 m jump limit, so only the drift rule sees it.
+    days = drifting_days(14, 0.06)
+    alerts = run_days(Detector(), days)
+
+    assert "changed" not in alerts[0]["reason"]
+
+
+def test_small_random_differences_are_not_drift():
+    # S2 wobbles 5 cm either side of the others, which cancels out over time.
+    days = [day(0.0, level=2.0 - 0.02 * i, S2=(0.0, 2.0 - 0.02 * i + (0.05 if i % 2 else -0.05)))
+            for i in range(14)]
+    assert run_days(Detector(), days) == []
+
+
+def test_one_big_step_is_not_counted_as_drift():
+    # A single 0.4 m step is under the jump limit, and one step isn't creep, so nothing is raised.
+    days = [day(0.0, level=2.0 - 0.02 * i, S2=(0.0, 2.0 - 0.02 * i + (0.4 if i >= 3 else 0.0)))
+            for i in range(14)]
+    assert run_days(Detector(), days) == []
+
+
+def test_drifting_sensor_snapping_back_is_not_flagged_again():
+    days = drifting_days(12, 0.08)
+    # On day 13 S2 drops straight back into line with the others.
+    days.append(day(0.0, level=round(2.0 - 0.02 * 12, 2)))
+    days.append(day(0.0, level=round(2.0 - 0.02 * 13, 2)))
+    alerts = run_days(Detector(), days)
+
+    assert len(alerts) == 1
+
+
+def test_lasting_level_shift_is_only_flagged_once():
+    # S5 jumps 0.8 m and stays there, as if the gauge had been moved, which is reported once and then accepted.
+    days = [day(0.0, level=2.0 - 0.02 * i, S5=(0.0, 2.0 - 0.02 * i + (0.8 if i >= 3 else 0.0)))
+            for i in range(10)]
+    alerts = run_days(Detector(), days)
+
+    assert len(alerts) == 1
+    assert "changed" in alerts[0]["reason"]

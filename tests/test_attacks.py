@@ -1,7 +1,7 @@
 """Tests for attacks.py: the right value is changed, and every change is logged."""
 import pytest
 
-from attacks import Attacker, attack_dates, describe
+from attacks import Attacker, attack_dates, day_after, describe
 
 PLAN = [
     {"type": "spike", "sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
@@ -9,6 +9,8 @@ PLAN = [
 ]
 
 FLATLINE = {"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 3, "field": "river_level_m"}
+
+DRIFT = {"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 3, "field": "river_level_m", "rate": 0.06}
 
 
 def test_rainfall_attack_changes_only_rainfall():
@@ -108,3 +110,34 @@ def test_flatline_logs_every_frozen_day():
 def test_describe_gives_a_readable_summary():
     assert describe(FLATLINE) == "flatline on S7 river_level_m from 2026-06-26 to 2026-06-28"
     assert describe(PLAN[0]) == "spike on S3 rainfall_mm on 2026-06-13"
+
+
+# Drift
+
+def test_drift_adds_a_little_more_each_day():
+    attacker = Attacker([DRIFT])
+    seen = [attacker.apply("S2", d, (0.0, 1.50)) for d in attack_dates(DRIFT)]
+
+    assert seen == [(0.0, 1.56), (0.0, 1.62), (0.0, 1.68)]
+
+
+def test_drift_stops_after_its_last_day():
+    attacker = Attacker([DRIFT])
+    for d in attack_dates(DRIFT):
+        attacker.apply("S2", d, (0.0, 1.50))
+
+    assert attacker.apply("S2", "2026-07-21", (0.0, 1.50)) == (0.0, 1.50)
+
+
+def test_drift_on_rainfall_is_rejected():
+    with pytest.raises(ValueError, match="river_level_m"):
+        Attacker([{**DRIFT, "field": "rainfall_mm"}])
+
+
+def test_day_after_is_the_snap_back_date():
+    assert day_after(DRIFT) == "2026-07-21"
+    assert day_after(PLAN[0]) == "2026-06-14"
+
+
+def test_describe_drift():
+    assert describe(DRIFT) == "drift on S2 river_level_m of +0.06 a day from 2026-07-18 to 2026-07-20"
