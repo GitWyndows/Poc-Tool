@@ -1,46 +1,87 @@
-"""False data injection: replaces what a sensor reports on planned days and logs every change."""
+"""Attacks on sensor data: single-day spikes and multi-day flatlines, with every change logged."""
+from datetime import date, timedelta
 
 # The two values a reading holds, in the order Sensor.read() returns them.
 FIELDS = ("rainfall_mm", "river_level_m")
+TYPES = ("spike", "flatline")
+
+
+def attack_dates(attack):
+    """Return every date an attack covers, as "YYYY-MM-DD" strings."""
+    if attack["type"] == "spike":
+        return [attack["date"]]
+
+    start = date.fromisoformat(attack["start"])
+    return [(start + timedelta(days=i)).isoformat() for i in range(attack["days"])]
+
+
+def describe(attack):
+    """A short plain-English summary of an attack, for printing."""
+    if attack["type"] == "spike":
+        return f"spike on {attack['sensor']} {attack['field']} on {attack['date']}"
+    dates = attack_dates(attack)
+    return f"flatline on {attack['sensor']} {attack['field']} from {dates[0]} to {dates[-1]}"
 
 
 class Attacker:
     def __init__(self, plan):
-        # Checking fields up front means a typo in config.py fails straight away instead of silently doing nothing.
+        # Checking the plan up front means a typo in config.py fails straight away instead of silently doing nothing.
         for attack in plan:
+            if attack.get("type") not in TYPES:
+                raise ValueError(f"Unknown attack type '{attack.get('type')}'. Use one of {TYPES}.")
             if attack["field"] not in FIELDS:
                 raise ValueError(f"Unknown field '{attack['field']}' in attack plan. Use one of {FIELDS}.")
 
-        # Keyed by (sensor, date) so each reading needs only one lookup to see if it's a target.
-        self.plan = {(a["sensor"], a["date"]): a for a in plan}
+        self.plan = plan
 
-        # The ground truth (what was changed, kept separate so detection can later be marked against it.
+        # Keyed by (sensor, date) so each reading needs only one lookup to find the attacks aimed at it.
+        self.targets = {}
+        for attack_id, attack in enumerate(plan):
+            for d in attack_dates(attack):
+                self.targets.setdefault((attack["sensor"], d), []).append(attack_id)
+
+        # The value a flatline repeats, captured from the real reading on its first day.
+        self.frozen = {}
+
+        # The ground truth: what was changed, kept separate so detection can later be marked against it.
         self.log = []
 
     def apply(self, sensor_id, date, reading):
         """Return the reading as the attacker wants it seen, logging any change."""
-        attack = self.plan.get((sensor_id, date))
+        attack_ids = self.targets.get((sensor_id, date))
 
         # Most readings pass through untouched, and a missing reading has nothing to tamper with.
-        if attack is None or reading is None:
+        if attack_ids is None or reading is None:
             return reading
 
         # Tuples can't be edited, so the tampered reading is built as a new one.
         values = list(reading)
-        i = FIELDS.index(attack["field"])
-        real_value = values[i]
-        values[i] = attack["value"]
 
-        self.log.append({
-            "date": date,
-            "sensor": sensor_id,
-            "field": attack["field"],
-            "real": real_value,
-            "fake": attack["value"],
-        })
+        for attack_id in attack_ids:
+            attack = self.plan[attack_id]
+            i = FIELDS.index(attack["field"])
+            real_value = values[i]
+
+            if attack["type"] == "spike":
+                values[i] = attack["value"]
+            else:
+                # A stuck sensor keeps repeating whatever it last reported before it froze.
+                self.frozen.setdefault(attack_id, real_value)
+                values[i] = self.frozen[attack_id]
+
+            self.log.append({
+                "attack": attack_id,
+                "type": attack["type"],
+                "date": date,
+                "sensor": sensor_id,
+                "field": attack["field"],
+                "real": real_value,
+                "fake": values[i],
+            })
+
         return tuple(values)
 
     def unused(self):
         """Return planned attacks that never ran, usually from a wrong sensor ID or date."""
-        ran = {(entry["sensor"], entry["date"]) for entry in self.log}
-        return [a for key, a in self.plan.items() if key not in ran]
+        ran = {entry["attack"] for entry in self.log}
+        return [a for attack_id, a in enumerate(self.plan) if attack_id not in ran]

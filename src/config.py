@@ -24,11 +24,12 @@ NUM_DAYS = 90
 # A fixed seed means everyone generates the same data, so test results can be compared.
 RANDOM_SEED = 42
 
-# Planned false data injections, only used with --attack. Rainfall spikes are placed on dry days so the fake value clearly disagrees with the other sensors.
+# Planned attacks, only used with --attack. Spikes fake one day and flatlines freeze a sensor on its first day value.
 ATTACKS = [
-    {"sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
-    {"sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
-    {"sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
+    {"type": "spike", "sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
+    {"type": "spike", "sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
+    {"type": "spike", "sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
+    {"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 7, "field": "river_level_m"},
 ]
 
 # Rainfall is flagged when it differs from the other sensors by more than 10 mm AND by more than 75% of their median.
@@ -37,3 +38,9 @@ RAIN_ALERT_RATIO = 0.75
 
 # A river level is flagged when its daily change differs from the other sensors' by more than 0.5 m.
 LEVEL_ALERT_M = 0.5
+
+# A sensor is flagged as stuck after reporting the exact same value this many days in a row.
+FLATLINE_DAYS = 4
+
+# Other sensors only count as moving if they changed by at least this much, so drizzle or 1 cm wobbles don't count.
+FLATLINE_MIN_MOVE = {"rainfall_mm": 1.0, "river_level_m": 0.05}

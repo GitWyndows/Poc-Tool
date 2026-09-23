@@ -15,7 +15,7 @@ import sys
 import time
 
 import config
-from attacks import Attacker
+from attacks import Attacker, attack_dates, describe
 from detection import Detector
 from sensor import Sensor
 
@@ -91,39 +91,53 @@ def print_attack_log(attacker, all_dates, shown_dates):
     if not attacker.log:
         print("No attacks were applied.")
 
-    for entry in attacker.log:
-        unit = "mm" if entry["field"] == "rainfall_mm" else "m"
-        print(f"{entry['date']}  {entry['sensor']}  {entry['field']:<14} "
-              f"real {entry['real']:>6.2f} {unit:<2}  ->  fake {entry['fake']:>6.2f} {unit}")
+    # Grouped by attack, so a week-long flatline reads as one entry rather than seven.
+    for attack_id, attack in enumerate(attacker.plan):
+        entries = [e for e in attacker.log if e["attack"] == attack_id]
+        if not entries:
+            continue
+
+        unit = "mm" if attack["field"] == "rainfall_mm" else "m"
+        first = entries[0]
+        if attack["type"] == "spike":
+            detail = f"real {first['real']:.2f} {unit} -> fake {first['fake']:.2f} {unit}"
+        else:
+            detail = f"frozen at {first['fake']:.2f} {unit} for {len(entries)} days"
+        print(f"{describe(attack)}: {detail}")
 
     # A planned attack that never ran would otherwise look like one the detector missed.
     known_ids = {sid for sid, _ in config.SENSORS}
     for a in attacker.unused():
-        if a["sensor"] not in known_ids or a["date"] not in all_dates:
-            print(f"WARNING: planned attack on {a['sensor']} for {a['date']} never ran. Check the ID and date.")
-        elif a["date"] not in shown_dates:
-            print(f"Skipped: attack on {a['sensor']} for {a['date']} falls outside the days shown.")
+        dates = attack_dates(a)
+        if a["sensor"] not in known_ids or dates[0] not in all_dates:
+            print(f"WARNING: {describe(a)} never ran. Check the ID and dates.")
+        elif dates[0] not in shown_dates:
+            print(f"Skipped: {describe(a)} falls outside the days shown.")
 
 
 def print_score(alerts, attacker):
-    # Matching on date, sensor and field means flagging the right sensor for the wrong reason isn't counted as a catch.
+    # An attack counts as caught if any alert matches its sensor and field on a day it was active.
+    attacked_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
     alert_keys = {(a["date"], a["sensor"], a["field"]) for a in alerts}
-    attack_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
 
-    caught = attack_keys & alert_keys
-    missed = attack_keys - alert_keys
-    false_alarms = alert_keys - attack_keys
+    ran = sorted({e["attack"] for e in attacker.log})
+    caught, missed = [], []
+    for attack_id in ran:
+        keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log if e["attack"] == attack_id}
+        (caught if keys & alert_keys else missed).append(attacker.plan[attack_id])
+
+    false_alarms = alert_keys - attacked_keys
 
     print("\n" + "=" * 65)
     print("DETECTION SCORE")
     print("=" * 65)
-    print(f"Attacks caught:  {len(caught)} of {len(attack_keys)}")
+    print(f"Attacks caught:  {len(caught)} of {len(ran)}")
     print(f"Attacks missed:  {len(missed)}")
     print(f"False alarms:    {len(false_alarms)}")
 
     # Listing them by name shows exactly where a rule needs work.
-    for date, sensor, field in sorted(missed):
-        print(f"  MISSED       {date}  {sensor}  {field}")
+    for attack in missed:
+        print(f"  MISSED       {describe(attack)}")
     for date, sensor, field in sorted(false_alarms):
         print(f"  FALSE ALARM  {date}  {sensor}  {field}")
 
