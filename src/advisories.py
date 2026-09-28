@@ -1,6 +1,8 @@
 """Public advisories: the weekly notices an agency publishes from its sensor readings."""
 from datetime import date
 
+import config
+
 
 def make_advisory(advisory_id, published, period_start, period_end, source, avg_rain_mm, avg_level_change_m):
     """Build one advisory as a dict, the same shape whether it's genuine or fake."""
@@ -39,17 +41,75 @@ def advisory_text(advisory):
             f"average rainfall {advisory['avg_rain_mm']:.1f} mm, river levels {direction}{amount}.")
 
 
-# Running this file directly shows what an advisory looks like, without needing the rest of the tool.
+def weekly_figures(readings_by_date, start, end):
+    """Return (average weekly rainfall, average river-level change) across the sensors, or None if there's no data."""
+    # ISO date strings sort in date order, so a plain comparison picks out the period.
+    days = [d for d in sorted(readings_by_date) if start <= d <= end]
+
+    # Each sensor's rainfall for the week is added up first, then those totals are averaged across the sensors.
+    totals = {}
+    for d in days:
+        for sid, reading in readings_by_date[d].items():
+            if reading is not None:
+                totals[sid] = totals.get(sid, 0.0) + reading[0]
+
+    # The change is measured from the first day of the period to the last, for sensors that reported on both.
+    first = readings_by_date.get(start, {})
+    last = readings_by_date.get(end, {})
+    changes = [last[sid][1] - first[sid][1] for sid in first if first.get(sid) and last.get(sid)]
+
+    if not totals or not changes:
+        return None
+    return sum(totals.values()) / len(totals), sum(changes) / len(changes)
+
+
+class AdvisoryWriter:
+    """Publishes a genuine advisory every few days from the readings as reported."""
+
+    def __init__(self, source=None):
+        self.source = source or config.APPROVED_SOURCES[0]
+
+        # Every day's reported readings, so any period can be looked back over.
+        self.readings_by_date = {}
+
+        # The days collected since the last advisory went out.
+        self.period = []
+        self.count = 0
+
+    def record(self, date, readings):
+        """Store one day's readings, and return an advisory if one is due today, otherwise None."""
+        # The agency only has what its own system reports, so tampered readings end up in its advisories too.
+        self.readings_by_date[date] = dict(readings)
+        self.period.append(date)
+
+        if len(self.period) < config.ADVISORY_EVERY_DAYS:
+            return None
+
+        start, end = self.period[0], self.period[-1]
+        self.period = []
+
+        figures = weekly_figures(self.readings_by_date, start, end)
+        if figures is None:
+            return None
+
+        # Published on the last day of the period, so the notice appears as soon as the week is complete.
+        self.count += 1
+        return make_advisory(f"ADV-{self.count:02d}", end, start, end, self.source, *figures)
+
+
+# Running this file directly prints every advisory for the 90 days, clean or with --attack.
 if __name__ == "__main__":
-    import config
+    import sys
 
-    genuine = make_advisory("ADV-04", "2026-06-29", "2026-06-22", "2026-06-28",
-                            config.APPROVED_SOURCES[0], 24.63, -0.1249)
-    print(genuine)
-    print(advisory_text(genuine))
-    print()
+    from attacks import Attacker
+    from main import load_sensors
 
-    fake = make_advisory("ADV-05", "2026-07-06", "2026-06-29", "2026-07-05",
-                         "WA Water Watch", 3.0, 0.0)
-    print(fake)
-    print(advisory_text(fake))
+    sensors, dates = load_sensors()
+    attacker = Attacker(config.ATTACKS if "--attack" in sys.argv else [])
+    writer = AdvisoryWriter()
+
+    for d in dates:
+        readings = {s.id: attacker.apply(s.id, d, s.read(d)) for s in sensors}
+        advisory = writer.record(d, readings)
+        if advisory:
+            print(f"{advisory['id']}  published {advisory['published']}  {advisory_text(advisory)}")
