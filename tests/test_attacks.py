@@ -1,6 +1,7 @@
 """Tests for attacks.py: the right value is changed, and every change is logged."""
 import pytest
 
+import config
 from attacks import Attacker, attack_dates, day_after, describe
 
 PLAN = [
@@ -11,6 +12,17 @@ PLAN = [
 FLATLINE = {"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 3, "field": "river_level_m"}
 
 DRIFT = {"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 3, "field": "river_level_m", "rate": 0.06}
+
+FAKE_FIGURES = {"type": "fake_figures", "date": "2026-06-07", "period_start": "2026-06-01", "period_end": "2026-06-07",
+                "source": "Water Corporation", "avg_rain_mm": 1.5, "avg_level_change_m": -0.8}
+
+FAKE_SOURCE = {"type": "fake_source", "date": "2026-06-07", "period_start": "2026-06-01", "period_end": "2026-06-07",
+               "source": "WA Water Watch"}
+
+
+def week_of_readings():
+    """Seven days where all 8 sensors get 2 mm a day and the rivers fall 1 cm a day."""
+    return {f"2026-06-{i + 1:02d}": {f"S{s}": (2.0, round(1.0 - 0.01 * i, 2)) for s in range(1, 9)} for i in range(7)}
 
 
 def test_rainfall_attack_changes_only_rainfall():
@@ -141,3 +153,70 @@ def test_day_after_is_the_snap_back_date():
 
 def test_describe_drift():
     assert describe(DRIFT) == "drift on S2 river_level_m of +0.06 a day from 2026-07-18 to 2026-07-20"
+
+
+# Fake advisories
+
+def test_fake_figures_quotes_made_up_numbers_under_an_approved_name():
+    attacker = Attacker([FAKE_FIGURES])
+    [fake] = attacker.fake_advisories("2026-06-07", week_of_readings())
+
+    assert fake["source"] == "Water Corporation"
+    assert (fake["avg_rain_mm"], fake["avg_level_change_m"]) == (1.5, -0.8)
+
+
+def test_fake_figures_log_shows_the_real_figures_too():
+    attacker = Attacker([FAKE_FIGURES])
+    attacker.fake_advisories("2026-06-07", week_of_readings())
+
+    entry = attacker.log[0]
+    assert entry["field"] == "advisory"
+    assert entry["sensor"] == "ADV-F1"
+    assert entry["real"] == (14.0, -0.06)
+    assert entry["fake"] == (1.5, -0.8)
+
+
+def test_fake_source_copies_the_real_figures():
+    attacker = Attacker([FAKE_SOURCE])
+    [fake] = attacker.fake_advisories("2026-06-07", week_of_readings())
+
+    assert fake["source"] == "WA Water Watch"
+    assert (fake["avg_rain_mm"], fake["avg_level_change_m"]) == (14.0, -0.06)
+
+
+def test_fake_advisories_only_go_out_on_their_date():
+    attacker = Attacker([FAKE_FIGURES])
+    assert attacker.fake_advisories("2026-06-06", week_of_readings()) == []
+    assert attacker.log == []
+
+
+def test_fake_source_with_no_readings_is_skipped_and_reported_unused():
+    attacker = Attacker([FAKE_SOURCE])
+    assert attacker.fake_advisories("2026-06-07", {}) == []
+    assert attacker.unused() == [FAKE_SOURCE]
+
+
+def test_advisory_attacks_leave_sensor_readings_alone():
+    attacker = Attacker([FAKE_FIGURES, FAKE_SOURCE])
+    assert attacker.apply("S1", "2026-06-07", (2.0, 0.94)) == (2.0, 0.94)
+
+
+def test_fake_source_using_an_approved_name_is_rejected():
+    with pytest.raises(ValueError, match="approved"):
+        Attacker([{**FAKE_SOURCE, "source": config.APPROVED_SOURCES[0]}])
+
+
+def test_fake_figures_without_figures_is_rejected():
+    bad = {k: v for k, v in FAKE_FIGURES.items() if k != "avg_rain_mm"}
+    with pytest.raises(ValueError, match="avg_rain_mm"):
+        Attacker([bad])
+
+
+def test_fake_advisory_with_a_backwards_period_is_rejected():
+    with pytest.raises(ValueError, match="ends before it starts"):
+        Attacker([{**FAKE_SOURCE, "period_start": "2026-06-07", "period_end": "2026-06-01"}])
+
+
+def test_describe_fake_advisories():
+    assert describe(FAKE_FIGURES) == "fake figures posing as Water Corporation on 2026-06-07"
+    assert describe(FAKE_SOURCE) == "fake advisory from 'WA Water Watch' on 2026-06-07"

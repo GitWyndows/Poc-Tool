@@ -164,3 +164,47 @@ def test_drift_is_caught_while_it_runs(data_file, monkeypatch, capsys):
     out = run(monkeypatch, capsys, "--attack")
     assert "Attacks caught:  1 of 1" in out
     assert "False alarms:    0" in out
+
+
+# Advisories in full runs
+
+def test_clean_run_publishes_twelve_advisories_with_none_flagged(data_file, monkeypatch, capsys):
+    out = run(monkeypatch, capsys)
+    advisory_lines = [line for line in out.splitlines() if "ADVISORY" in line]
+
+    assert len(advisory_lines) == 12
+    assert not any("<-- ALERT" in line for line in advisory_lines)
+
+
+def test_fake_figures_advisory_is_caught(data_file, monkeypatch, capsys):
+    monkeypatch.setattr(config, "ATTACKS", [])
+    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [
+        {"type": "fake_figures", "date": "2026-06-28", "period_start": "2026-06-22", "period_end": "2026-06-28",
+         "source": "Water Corporation", "avg_rain_mm": 6.5, "avg_level_change_m": -0.85},
+    ])
+
+    out = run(monkeypatch, capsys, "--attack")
+    assert "ALERT  ADV-F1 advisory: claims 6.5 mm of rain" in out
+    assert "Attacks caught:  1 of 1" in out
+    assert "False alarms:    0" in out
+
+
+def test_fake_source_advisory_is_caught(data_file, monkeypatch, capsys):
+    monkeypatch.setattr(config, "ATTACKS", [])
+    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [
+        {"type": "fake_source", "date": "2026-08-16", "period_start": "2026-08-10", "period_end": "2026-08-16",
+         "source": "WA Water Watch"},
+    ])
+
+    out = run(monkeypatch, capsys, "--attack")
+    assert "ALERT  ADV-F1 advisory: source 'WA Water Watch' is not approved" in out
+    assert "Attacks caught:  1 of 1" in out
+    assert "False alarms:    0" in out
+
+
+def test_attack_log_describes_fake_advisories(data_file, monkeypatch, capsys):
+    monkeypatch.setattr(config, "ATTACKS", [])
+
+    out = run(monkeypatch, capsys, "--attack")
+    assert "ADV-F1 claimed 6.5 mm, -0.85 m when the readings showed" in out
+    assert "ADV-F2 copied the real figures under an unapproved name" in out

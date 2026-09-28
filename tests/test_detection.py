@@ -1,6 +1,6 @@
 """Tests for detection.py, using small hand-made days instead of the CSV."""
 import config
-
+from advisories import AdvisoryWriter, make_advisory
 from detection import Detector
 
 SENSORS = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"]
@@ -221,3 +221,88 @@ def test_lasting_level_shift_is_only_flagged_once():
 
     assert len(alerts) == 1
     assert "changed" in alerts[0]["reason"]
+
+
+# Advisories
+
+def seen_week(detector, **overrides):
+    """Feed the detector a week where every sensor gets 2 mm a day and the rivers fall 1 cm a day."""
+    for i in range(7):
+        detector.check_day(f"2026-06-{i + 1:02d}", day(2.0, level=round(1.0 - 0.01 * i, 2), **overrides))
+
+
+def advisory(source="Water Corporation", rain=14.0, change=-0.06, start="2026-06-01", end="2026-06-07"):
+    return make_advisory("ADV-T", end, start, end, source, rain, change)
+
+
+def test_advisory_matching_the_readings_passes():
+    detector = Detector()
+    seen_week(detector)
+    assert detector.check_advisory(advisory()) == []
+
+
+def test_every_genuine_advisory_from_the_writer_passes():
+    detector, writer = Detector(), AdvisoryWriter()
+    for i in range(14):
+        readings = day(float(i % 3), level=round(1.0 + 0.02 * (i % 4), 2))
+        date = f"2026-06-{i + 1:02d}"
+        detector.check_day(date, readings)
+        published = writer.record(date, readings)
+        if published:
+            assert detector.check_advisory(published) == []
+
+
+def test_unapproved_source_is_flagged_even_with_correct_figures():
+    detector = Detector()
+    seen_week(detector)
+    alerts = detector.check_advisory(advisory(source="WA Water Watch"))
+
+    assert len(alerts) == 1
+    assert alerts[0]["reason"] == "source 'WA Water Watch' is not approved"
+
+
+def test_wrong_rainfall_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(rain=3.0))
+    assert "claims 3.0 mm of rain vs 14.0 mm" in alert["reason"]
+
+
+def test_wrong_level_change_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(change=-0.5))
+    assert "claims levels changed -0.50 m vs -0.06 m" in alert["reason"]
+
+
+def test_several_problems_give_one_alert_listing_them_all():
+    detector = Detector()
+    seen_week(detector)
+    alerts = detector.check_advisory(advisory(source="WA Water Watch", rain=3.0, change=-0.5))
+
+    assert len(alerts) == 1
+    assert alerts[0]["reason"].count(";") == 2
+
+
+def test_small_rounding_differences_are_allowed():
+    detector = Detector()
+    seen_week(detector)
+    assert detector.check_advisory(advisory(rain=14.1, change=-0.07)) == []
+
+
+def test_advisory_about_days_with_no_readings_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(start="2026-07-01", end="2026-07-07"))
+    assert "no readings" in alert["reason"]
+
+
+def test_advisory_matching_tampered_readings_passes():
+    # A known limitation: the checker can only compare against what the sensors report, so if S3 is faking
+    # 20 mm a day, an advisory quoting those figures looks consistent and is not flagged.
+    detector = Detector()
+    seen_week(detector, S3=(20.0, 1.0))
+    tampered_rain = (7 * 14.0 + 7 * 20.0) / 8
+    tampered_change = -0.06 * 7 / 8
+
+    assert detector.check_advisory(advisory(rain=tampered_rain, change=tampered_change)) == []
