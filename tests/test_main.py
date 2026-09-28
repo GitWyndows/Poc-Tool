@@ -6,6 +6,7 @@ import pytest
 import config
 import generate_data
 import main
+from advisories import AdvisoryWriter
 from attacks import Attacker
 from detection import Detector
 
@@ -60,7 +61,7 @@ def test_print_day_marks_the_flagged_sensor(data_file, capsys):
     sensors, _ = main.load_sensors()
     attacker = Attacker(config.ATTACKS)
 
-    alerts = main.print_day(13, "2026-06-13", sensors, attacker, Detector())
+    alerts = main.print_day(13, "2026-06-13", sensors, attacker, Detector(), AdvisoryWriter())
     out = capsys.readouterr().out
 
     assert [a["sensor"] for a in alerts] == ["S3"]
@@ -122,7 +123,7 @@ def test_clean_run_has_no_false_alarms(data_file, monkeypatch, capsys):
 
 def test_attack_run_catches_every_planned_attack(data_file, monkeypatch, capsys):
     out = run(monkeypatch, capsys, "--attack")
-    total = len(config.ATTACKS)
+    total = len(config.ATTACKS) + len(config.ADVISORY_ATTACKS)
 
     assert f"Attacks caught:  {total} of {total}" in out
     assert "False alarms:    0" in out
@@ -138,6 +139,7 @@ def test_short_run_marks_later_attacks_as_skipped(data_file, monkeypatch, capsys
 def test_wrong_sensor_id_in_plan_gives_a_warning(data_file, monkeypatch, capsys):
     bad_plan = [{"type": "spike", "sensor": "S99", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0}]
     monkeypatch.setattr(config, "ATTACKS", bad_plan)
+    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
 
     out = run(monkeypatch, capsys, "--attack")
     assert "WARNING: spike on S99" in out
@@ -146,6 +148,7 @@ def test_wrong_sensor_id_in_plan_gives_a_warning(data_file, monkeypatch, capsys)
 def test_flatline_counts_as_one_caught_attack(data_file, monkeypatch, capsys):
     plan = [{"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 7, "field": "river_level_m"}]
     monkeypatch.setattr(config, "ATTACKS", plan)
+    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
 
     out = run(monkeypatch, capsys, "--attack")
     assert "frozen at 2.68 m for 7 days" in out
@@ -156,6 +159,7 @@ def test_flatline_counts_as_one_caught_attack(data_file, monkeypatch, capsys):
 def test_drift_is_caught_while_it_runs(data_file, monkeypatch, capsys):
     plan = [{"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06}]
     monkeypatch.setattr(config, "ATTACKS", plan)
+    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
 
     out = run(monkeypatch, capsys, "--attack")
     assert "Attacks caught:  1 of 1" in out

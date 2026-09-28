@@ -1,9 +1,9 @@
-"""Reads the CSV and prints each day's sensor readings to the terminal.
+"""Reads the CSV and prints each day's sensor readings and weekly advisories to the terminal.
 
     python src/main.py                 # all 90 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
-    python src/main.py --attack        # apply the attacks planned in config.py
+    python src/main.py --attack        # apply the sensor and advisory attacks planned in config.py
 
 Detection always runs, and a score is printed at the end.
 
@@ -15,7 +15,8 @@ import sys
 import time
 
 import config
-from attacks import Attacker, attack_dates, day_after, describe
+from advisories import AdvisoryWriter, advisory_text
+from attacks import ADVISORY_TYPES, Attacker, attack_dates, day_after, describe
 from detection import Detector
 from sensor import Sensor
 
@@ -49,7 +50,7 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
-def print_day(day_number, date, sensors, attacker, detector):
+def print_day(day_number, date, sensors, attacker, detector, writer):
     # Every reading passes through the attacker first, just as tampering in transit would.
     readings = {s.id: attacker.apply(s.id, date, s.read(date)) for s in sensors}
 
@@ -75,6 +76,14 @@ def print_day(day_number, date, sensors, attacker, detector):
             rain, level = reading
             print(f"{s.id:<8}{s.name:<24}{rain:>15.1f}{level:>18.2f}{mark}")
 
+    # Genuine and fake advisories go out together and are checked the same way, with nothing marking which is which.
+    published = [writer.record(date, readings)] + attacker.fake_advisories(date, writer.readings_by_date)
+    for advisory in filter(None, published):
+        advisory_alerts = detector.check_advisory(advisory)
+        alerts += advisory_alerts
+        mark = "  <-- ALERT" if advisory_alerts else ""
+        print(f"  ADVISORY {advisory['id']:<7}{advisory_text(advisory)}{mark}")
+
     # Reasons go under the table so the columns stay aligned.
     for a in alerts:
         print(f"  ALERT  {a['sensor']} {a['field']}: {a['reason']}")
@@ -91,28 +100,36 @@ def print_attack_log(attacker, all_dates, shown_dates):
     if not attacker.log:
         print("No attacks were applied.")
 
-    # Grouped by attack, so a week long flatline reads as one entry rather than seven.
+    # Grouped by attack, so a week-long flatline reads as one entry rather than seven.
     for attack_id, attack in enumerate(attacker.plan):
         entries = [e for e in attacker.log if e["attack"] == attack_id]
         if not entries:
             continue
 
-        unit = "mm" if attack["field"] == "rainfall_mm" else "m"
         first = entries[0]
         last = entries[-1]
-        if attack["type"] == "spike":
-            detail = f"real {first['real']:.2f} {unit} -> fake {first['fake']:.2f} {unit}"
-        elif attack["type"] == "drift":
-            detail = f"{last['fake'] - last['real']:+.2f} {unit} off by the last day"
+        if attack["type"] == "fake_figures":
+            (fake_rain, fake_change), (real_rain, real_change) = first["fake"], first["real"]
+            detail = (f"{first['sensor']} claimed {fake_rain:.1f} mm, {fake_change:+.2f} m "
+                      f"when the readings showed {real_rain:.1f} mm, {real_change:+.2f} m")
+        elif attack["type"] == "fake_source":
+            detail = f"{first['sensor']} copied the real figures under an unapproved name"
         else:
-            detail = f"frozen at {first['fake']:.2f} {unit} for {len(entries)} days"
+            unit = "mm" if attack["field"] == "rainfall_mm" else "m"
+            if attack["type"] == "spike":
+                detail = f"real {first['real']:.2f} {unit} -> fake {first['fake']:.2f} {unit}"
+            elif attack["type"] == "drift":
+                detail = f"{last['fake'] - last['real']:+.2f} {unit} off by the last day"
+            else:
+                detail = f"frozen at {first['fake']:.2f} {unit} for {len(entries)} days"
         print(f"{describe(attack)}: {detail}")
 
     # A planned attack that never ran would otherwise look like one the detector missed.
     known_ids = {sid for sid, _ in config.SENSORS}
     for a in attacker.unused():
         dates = attack_dates(a)
-        if a["sensor"] not in known_ids or dates[0] not in all_dates:
+        wrong_sensor = a["type"] not in ADVISORY_TYPES and a["sensor"] not in known_ids
+        if wrong_sensor or dates[0] not in all_dates:
             print(f"WARNING: {describe(a)} never ran. Check the ID and dates.")
         elif dates[0] not in shown_dates:
             print(f"Skipped: {describe(a)} falls outside the days shown.")
@@ -129,12 +146,14 @@ def print_score(alerts, attacker):
     caught, caught_late, missed = [], [], []
     for attack_id in ran:
         attack = attacker.plan[attack_id]
-        keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log if e["attack"] == attack_id}
+        entries = [e for e in attacker.log if e["attack"] == attack_id]
+        keys = {(e["date"], e["sensor"], e["field"]) for e in entries}
+        late_keys = {(day_after(attack), e["sensor"], e["field"]) for e in entries}
 
-        # Caught means an alert on the right sensor and field while the attack was running.
+        # Caught means an alert on the right sensor (or advisory) and field while the attack was running.
         if keys & alert_keys:
             caught.append(attack)
-        elif (day_after(attack), attack["sensor"], attack["field"]) in alert_keys:
+        elif late_keys & alert_keys:
             caught_late.append(attack)
         else:
             missed.append(attack)
@@ -163,14 +182,15 @@ def main():
     parser = argparse.ArgumentParser(description="Print simulated sensor readings.")
     parser.add_argument("--days", type=int, help="Only show this many days")
     parser.add_argument("--delay", type=float, default=0, help="Seconds to wait between days")
-    parser.add_argument("--attack", action="store_true", help="Apply the attacks planned in config.py")
+    parser.add_argument("--attack", action="store_true", help="Apply the sensor and advisory attacks planned in config.py")
     args = parser.parse_args()
 
     sensors, dates = load_sensors()
 
     # Attacks are opt-in so a clean run is always available to compare against.
-    attacker = Attacker(config.ATTACKS if args.attack else [])
+    attacker = Attacker(config.ATTACKS + config.ADVISORY_ATTACKS if args.attack else [])
     detector = Detector()
+    writer = AdvisoryWriter()
     all_alerts = []
 
     # Note that --days 0 counts as not set, so it shows every day.
@@ -178,7 +198,7 @@ def main():
 
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
     for i, date in enumerate(shown_dates, start=1):
-        all_alerts += print_day(i, date, sensors, attacker, detector)
+        all_alerts += print_day(i, date, sensors, attacker, detector, writer)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:
