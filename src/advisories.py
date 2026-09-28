@@ -105,11 +105,19 @@ if __name__ == "__main__":
     from main import load_sensors
 
     sensors, dates = load_sensors()
-    attacker = Attacker(config.ATTACKS if "--attack" in sys.argv else [])
+    attacking = "--attack" in sys.argv
+    attacker = Attacker(config.ATTACKS + config.ADVISORY_ATTACKS if attacking else [])
     writer = AdvisoryWriter()
 
     for d in dates:
         readings = {s.id: attacker.apply(s.id, d, s.read(d)) for s in sensors}
         advisory = writer.record(d, readings)
         if advisory:
-            print(f"{advisory['id']}  published {advisory['published']}  {advisory_text(advisory)}")
+            print(f"{advisory['id']}   published {advisory['published']}  {advisory_text(advisory)}")
+
+        # Marked here only because this demo can see the attack plan. The real output won't know which is fake.
+        for fake in attacker.fake_advisories(d, writer.readings_by_date):
+            print(f"{fake['id']}*  published {fake['published']}  {advisory_text(fake)}")
+
+    if attacking:
+        print("\n* fake, planted by the attacker")

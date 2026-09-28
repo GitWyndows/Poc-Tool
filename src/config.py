@@ -62,3 +62,12 @@ APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of
 
 # A genuine advisory is published every this many days, covering the days since the last one.
 ADVISORY_EVERY_DAYS = 7
+
+# Planned fake advisories, only used with --attack. Fake figures pose as an approved source with made up numbers,
+# while a fake source quotes the real numbers under a name that isn't approved.
+ADVISORY_ATTACKS = [
+    {"type": "fake_figures", "date": "2026-06-28", "period_start": "2026-06-22", "period_end": "2026-06-28",
+     "source": "Water Corporation", "avg_rain_mm": 6.5, "avg_level_change_m": -0.85},
+    {"type": "fake_source", "date": "2026-08-16", "period_start": "2026-08-10", "period_end": "2026-08-16",
+     "source": "WA Water Watch"},
+]
