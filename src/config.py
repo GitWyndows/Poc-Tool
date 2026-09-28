@@ -56,3 +56,9 @@ DRIFT_MAX_STEP = 0.2
 # The drift limit starts at 0.3 m and grows by a quarter of how far the rivers moved in that time.
 DRIFT_ALERT_M = 0.3
 DRIFT_ALERT_RATIO = 0.25
+
+# Advisories from any other source are treated as untrustworthy, however believable their figures.
+APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]
+
+# A genuine advisory is published every this many days, covering the days since the last one.
+ADVISORY_EVERY_DAYS = 7
