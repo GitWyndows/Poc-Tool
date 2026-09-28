@@ -1,7 +1,8 @@
-"""Detection rules: spikes and jumps that disagree with the other sensors, stuck sensors, and slow drift."""
+"""Detection rules: spikes and jumps that disagree with the other sensors, stuck sensors, slow drift, and bad advisories."""
 from statistics import median
 
 import config
+from advisories import weekly_figures
 
 FIELDS = ("rainfall_mm", "river_level_m")
 
@@ -17,21 +18,25 @@ class Detector:
         # Flatlines already reported, so a stuck sensor raises one alert rather than one every day.
         self.flat_alerted = set()
 
-        # Each sensor's recent daily differences from the other rivers (plus how much the rivers moved).
+        # Each sensor's recent daily differences from the other rivers, plus how much the rivers moved.
         self.gaps = {}
         self.movement = {}
 
         # Sensors already reported as drifting, which stay under watch until they fall back in line.
         self.drift_alerted = set()
 
-        # Yesterday's reported river levels and sensors flagged for a jump yesterday.
+        # Yesterday's reported river levels, and sensors flagged for a jump yesterday.
         self.last_raw = {}
         self.jumped = set()
+
+        # Every day's readings as seen, so an advisory's figures can be checked against them.
+        self.readings_by_date = {}
 
     def check_day(self, date, readings):
         """Return a list of alerts for one day, given {sensor_id: (rainfall_mm, river_level_m) or None}."""
         present = {sid: r for sid, r in readings.items() if r is not None}
         self._record(present)
+        self.readings_by_date[date] = dict(readings)
 
         alerts = self._check_flatline(date, present)
         alerts += self._check_rain_spike(date, present)
@@ -173,7 +178,7 @@ class Detector:
         return alerts
 
     def _add_gap(self, sid, gap, expected):
-        # Drift is many small steps, so a single big step (a storm or a snapback) doesn't count towards it.
+        # Drift is many small steps, so a single big step (a storm or a snap-back) doesn't count towards it.
         if abs(gap) > config.DRIFT_MAX_STEP:
             gap = 0.0
 
@@ -186,6 +191,32 @@ class Detector:
     def _drift_limit(self, sid):
         # Stormy weeks naturally spread the rivers apart, so the limit grows with how much they moved.
         return config.DRIFT_ALERT_M + config.DRIFT_ALERT_RATIO * sum(self.movement.get(sid, []))
+
+    def check_advisory(self, advisory):
+        """Return a list with one alert if an advisory's source or figures don't hold up, otherwise an empty list."""
+        problems = []
+
+        # Believable figures don't make up for an unknown source, since copying real numbers is how an impersonator works.
+        if advisory["source"] not in config.APPROVED_SOURCES:
+            problems.append(f"source '{advisory['source']}' is not approved")
+
+        # The figures are rebuilt from the readings the detector has seen, using the same maths as the writer.
+        figures = weekly_figures(self.readings_by_date, advisory["period_start"], advisory["period_end"])
+        if figures is None:
+            problems.append("no readings exist for the period it describes")
+        else:
+            rain, change = figures
+            if abs(advisory["avg_rain_mm"] - rain) > config.ADVISORY_RAIN_TOLERANCE_MM:
+                problems.append(f"claims {advisory['avg_rain_mm']:.1f} mm of rain vs {rain:.1f} mm in the readings")
+            if abs(advisory["avg_level_change_m"] - change) > config.ADVISORY_LEVEL_TOLERANCE_M:
+                problems.append(f"claims levels changed {advisory['avg_level_change_m']:+.2f} m "
+                                f"vs {change:+.2f} m in the readings")
+
+        if not problems:
+            return []
+
+        # One alert per advisory, with every problem listed, so a notice that fails both checks isn't counted twice.
+        return [self._alert(advisory["published"], advisory["id"], "advisory", advisory["source"], "; ".join(problems))]
 
     @staticmethod
     def _alert(date, sensor_id, field, value, reason):

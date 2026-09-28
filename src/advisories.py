@@ -97,27 +97,26 @@ class AdvisoryWriter:
         return make_advisory(f"ADV-{self.count:02d}", end, start, end, self.source, *figures)
 
 
-# Running this file directly prints every advisory for the 90 days, clean or with --attack.
+# Running this file directly prints every advisory for the 90 days and whether the checker accepts it.
 if __name__ == "__main__":
     import sys
 
     from attacks import Attacker
+    from detection import Detector
     from main import load_sensors
 
     sensors, dates = load_sensors()
     attacking = "--attack" in sys.argv
     attacker = Attacker(config.ATTACKS + config.ADVISORY_ATTACKS if attacking else [])
     writer = AdvisoryWriter()
+    detector = Detector()
 
     for d in dates:
         readings = {s.id: attacker.apply(s.id, d, s.read(d)) for s in sensors}
-        advisory = writer.record(d, readings)
-        if advisory:
-            print(f"{advisory['id']}   published {advisory['published']}  {advisory_text(advisory)}")
+        detector.check_day(d, readings)
 
-        # Marked here only because this demo can see the attack plan. The real output won't know which is fake.
-        for fake in attacker.fake_advisories(d, writer.readings_by_date):
-            print(f"{fake['id']}*  published {fake['published']}  {advisory_text(fake)}")
-
-    if attacking:
-        print("\n* fake, planted by the attacker")
+        published = [writer.record(d, readings)] + attacker.fake_advisories(d, writer.readings_by_date)
+        for advisory in filter(None, published):
+            alerts = detector.check_advisory(advisory)
+            print(f"{advisory['id']:<7} {advisory_text(advisory)}")
+            print(f"        {'ALERT: ' + alerts[0]['reason'] if alerts else 'OK'}")
