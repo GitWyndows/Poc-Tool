@@ -1,4 +1,4 @@
-"""Tests for main.py: strict loading of the streamflow CSV, and printing it."""
+"""Tests for main.py: strict loading of the streamflow CSV, printing it, and checking it with the detector."""
 import sys
 
 import pytest
@@ -122,12 +122,22 @@ def test_zero_flow_is_allowed(tmp_path, monkeypatch):
 
 def test_print_day_shows_every_gauge_and_its_flow(capsys):
     sensors, dates = main.load_sensors()
-    main.print_day(1, dates[0], sensors)
+    main.print_day(1, dates[0], sensors, [])
     out = capsys.readouterr().out
 
-    assert "Day 1  |  2026-06-01" in out
+    assert "Day 1  |  2026-06-01  |  learning" in out
     assert all(sid in out for sid in IDS)
     assert "Lefroy Brook - Cascades" in out and "66.35" in out
+
+
+def test_print_day_shows_alerts_and_drops_the_learning_label(capsys):
+    sensors, _ = main.load_sensors()
+    alert = {"date": "2026-07-15", "sensor": "608171", "rule": "jump", "value": 500.0, "reason": "changed +300%"}
+    main.print_day(45, "2026-07-15", sensors, [alert])
+    out = capsys.readouterr().out
+
+    assert "Day 45  |  2026-07-15\n" in out
+    assert "ALERT 608171 jump: changed +300%" in out
 
 
 def test_days_option_limits_the_output(monkeypatch, capsys):
@@ -137,6 +147,7 @@ def test_days_option_limits_the_output(monkeypatch, capsys):
 
     assert "Day 3  |  2026-06-03" in out
     assert "Day 4" not in out
+    assert "Still learning, so nothing was checked" in out
 
 
 def test_full_run_shows_all_92_days(monkeypatch, capsys):
@@ -146,3 +157,14 @@ def test_full_run_shows_all_92_days(monkeypatch, capsys):
 
     assert "Day 92  |  2026-08-31" in out
     assert out.startswith("Streamflow from 5 DWER gauges, 2026-06-01 to 2026-08-31")
+
+
+def test_clean_real_data_raises_no_alerts(monkeypatch, capsys):
+    # The real readings are untampered, so every alert here would be a false alarm.
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    main.main()
+    out = capsys.readouterr().out
+
+    assert "ALERT" not in out
+    assert out.rstrip().endswith("0 alert(s) raised")
+    assert "Limits learned from 2026-06-01 to 2026-06-30" in out

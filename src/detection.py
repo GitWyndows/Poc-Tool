@@ -1,223 +1,201 @@
-"""Detection rules: spikes and jumps that disagree with the other sensors, stuck sensors, slow drift, and bad advisories."""
+"""Detection rules for streamflow: sudden jumps, stuck gauges and slow drift, each judged against the other gauges."""
+import math
 from statistics import median
 
 import config
-from advisories import weekly_figures
 
-FIELDS = ("rainfall_mm", "river_level_m")
+
+def to_log(flow):
+    # Logs turn doubling into the same step at 10 or 300 ML/day, and the +1 lets a dry stream read 0 without breaking.
+    return math.log(flow + 1)
+
+
+def percent(log_change):
+    """A change in logs as a plain percentage, e.g. 0.69 becomes "+99%"."""
+    return f"{math.exp(log_change) - 1:+.0%}"
 
 
 class Detector:
     def __init__(self):
-        # Each sensor's last trusted river level, so a flagged value never becomes tomorrow's baseline.
-        self.last_level = {}
+        # Each gauge's last trusted flow (as a log), so a flagged value never becomes tomorrow's baseline.
+        self.last = {}
 
-        # Recent reported values per (sensor, field), just long enough to spot a flatline.
-        self.history = {}
-
-        # Flatlines already reported, so a stuck sensor raises one alert rather than one every day.
-        self.flat_alerted = set()
-
-        # Each sensor's recent daily differences from the other rivers, plus how much the rivers moved.
-        self.gaps = {}
-        self.movement = {}
-
-        # Sensors already reported as drifting, which stay under watch until they fall back in line.
-        self.drift_alerted = set()
-
-        # Yesterday's reported river levels, and sensors flagged for a jump yesterday.
+        # Yesterday's reported flow (as a log), and gauges flagged for a jump yesterday.
         self.last_raw = {}
         self.jumped = set()
 
-        # Every day's readings as seen, so an advisory's figures can be checked against them.
-        self.readings_by_date = {}
+        # Recent reported flows per gauge, just long enough to spot a flatline.
+        self.history = {}
 
-    def check_day(self, date, readings):
-        """Return a list of alerts for one day, given {sensor_id: (rainfall_mm, river_level_m) or None}."""
-        present = {sid: r for sid, r in readings.items() if r is not None}
-        self._record(present)
-        self.readings_by_date[date] = dict(readings)
+        # Flatlines already reported, so a stuck gauge raises one alert rather than one every day.
+        self.flat_alerted = set()
 
-        alerts = self._check_flatline(date, present)
-        alerts += self._check_rain_spike(date, present)
-        alerts += self._check_river(date, present)
+        # Each gauge's recent daily gaps from the others, whose total shows how far it has drifted.
+        self.gaps = {}
+
+        # Gauges already reported as drifting, which stay under watch until they fall back in line.
+        self.drift_alerted = set()
+
+        # The biggest gaps seen while learning, which become each gauge's limits once checking starts.
+        self.learned_jump = {}
+        self.learned_drift = {}
+        self.jump_limit = {}
+        self.drift_limit = {}
+
+    def check_day(self, date, flows):
+        """Return a list of alerts for one day, given {gauge_id: flow in ML/day}."""
+        learning = date <= config.LEARN_END
+        if not learning and not self.jump_limit:
+            self._set_limits(flows)
+
+        self._record(flows)
+        alerts = [] if learning else self._check_flatline(date, flows)
+
+        # A stuck gauge snapping back is expected, so it restarts from its next value without a check.
+        for sid in self.flat_alerted:
+            self.last.pop(sid, None)
+
+        # Gauges differ hugely in size, so each day's change is compared rather than the flow itself.
+        logs = {sid: to_log(f) for sid, f in flows.items()}
+        changes = {sid: log - self.last[sid] for sid, log in logs.items() if sid in self.last}
+
+        if learning:
+            self._learn(changes)
+        else:
+            alerts += self._check_changes(date, flows, changes)
+
+        # While learning every value is trusted; after that, only gauges with no baseline start afresh.
+        for sid, log in logs.items():
+            if learning or (sid not in changes and sid not in self.flat_alerted):
+                self.last[sid] = log
+            self.last_raw[sid] = log
+
         return alerts
 
-    def _record(self, present):
-        # One extra day is kept so a run can be seen changing, not just sitting still.
-        for sid, reading in present.items():
-            for i, field in enumerate(FIELDS):
-                values = self.history.setdefault((sid, field), [])
-                values.append(reading[i])
-                del values[:-(config.FLATLINE_DAYS + 1)]
-
-    def _is_flat(self, sid, field):
-        # Exactly equal, since a real gauge reading to 0.01 m almost never repeats for days while the river moves.
-        recent = self.history.get((sid, field), [])[-config.FLATLINE_DAYS:]
-        return len(recent) == config.FLATLINE_DAYS and len(set(recent)) == 1
-
-    def _has_moved(self, sid, field):
-        # The full range over the window, so a slow steady fall still counts as moving.
-        recent = self.history.get((sid, field), [])[-config.FLATLINE_DAYS:]
-        return max(recent) - min(recent) >= config.FLATLINE_MIN_MOVE[field]
-
-    def _check_flatline(self, date, present):
-        alerts = []
-        for field in FIELDS:
-            for sid in present:
-                key = (sid, field)
-
-                # Once the value moves again, the sensor can be flagged afresh if it sticks later.
-                if not self._is_flat(sid, field):
-                    self.flat_alerted.discard(key)
-                    continue
-                if key in self.flat_alerted:
-                    continue
-
-                # A flat value only matters if the others moved, since every gauge reads 0 mm on a dry week.
-                others = [o for o in present if o != sid and len(self.history.get((o, field), [])) >= config.FLATLINE_DAYS]
-                moving = [o for o in others if self._has_moved(o, field)]
-                if len(others) < 3 or len(moving) < len(others) / 2:
-                    continue
-
-                self.flat_alerted.add(key)
-                value = self.history[key][-1]
-                alerts.append(self._alert(date, sid, field, value,
-                                          f"stuck at {value} for {config.FLATLINE_DAYS} days while "
-                                          f"{len(moving)} of {len(others)} other sensors changed"))
-        return alerts
-
-    def _check_rain_spike(self, date, present):
-        alerts = []
-
-        # Rainfall is compared directly, because sensors in the same area see much the same weather.
-        for sid, (rain, _) in present.items():
-            others = [r[0] for other, r in present.items() if other != sid]
-
-            # A median of fewer than three sensors can be dragged off by a single bad one.
+    def _learn(self, changes):
+        # June is assumed clean, so the biggest gaps seen then show how much these gauges naturally disagree.
+        for sid, change in changes.items():
+            others = [c for other, c in changes.items() if other != sid]
             if len(others) < 3:
                 continue
 
-            expected = median(others)
-            gap = abs(rain - expected)
+            gap = change - median(others)
+            self.learned_jump.setdefault(sid, []).append(abs(gap))
 
-            # Both limits must be passed, so small differences on light days and normal spread on heavy days are ignored.
-            if gap > max(config.RAIN_ALERT_MM, config.RAIN_ALERT_RATIO * expected):
-                alerts.append(self._alert(date, sid, "rainfall_mm", rain,
-                                          f"{rain:.1f} mm vs {expected:.1f} mm from the other sensors"))
+            self._add_gap(sid, gap)
+            if len(self.gaps[sid]) == config.DRIFT_DAYS:
+                self.learned_drift.setdefault(sid, []).append(abs(sum(self.gaps[sid])))
+
+    def _set_limits(self, flows):
+        # Stopping here beats guessing, since a limit learned from too few days would flag everything.
+        for sid in flows:
+            if sid not in self.learned_drift:
+                raise ValueError(f"{sid} needs at least {config.DRIFT_DAYS + 1} days of learning "
+                                 f"up to {config.LEARN_END} before checks can start.")
+
+            # Headroom above the worst June day, since July and August will bring days a little rougher than any in June.
+            self.jump_limit[sid] = config.JUMP_MARGIN * max(self.learned_jump[sid])
+            self.drift_limit[sid] = config.DRIFT_MARGIN * max(self.learned_drift[sid])
+
+    def _record(self, flows):
+        # One extra day is kept so a run can be seen changing, not just sitting still.
+        for sid, flow in flows.items():
+            values = self.history.setdefault(sid, [])
+            values.append(flow)
+            del values[:-(config.FLATLINE_DAYS + 1)]
+
+    def _is_flat(self, sid):
+        # Exactly equal, since a real gauge reading to four figures almost never repeats for days.
+        recent = self.history.get(sid, [])[-config.FLATLINE_DAYS:]
+        return len(recent) == config.FLATLINE_DAYS and len(set(recent)) == 1
+
+    def _has_moved(self, sid):
+        # The full range over the window, so a slow steady fall still counts as moving.
+        recent = self.history.get(sid, [])[-config.FLATLINE_DAYS:]
+        return to_log(max(recent)) - to_log(min(recent)) >= config.FLATLINE_MIN_MOVE
+
+    def _check_flatline(self, date, flows):
+        alerts = []
+        for sid in flows:
+            # Once the value moves again, the gauge can be flagged afresh if it sticks later.
+            if not self._is_flat(sid):
+                self.flat_alerted.discard(sid)
+                continue
+            if sid in self.flat_alerted:
+                continue
+
+            # A flat value only matters if the others moved, since every gauge sits still in a long dry spell.
+            others = [o for o in flows if o != sid and len(self.history.get(o, [])) >= config.FLATLINE_DAYS]
+            moving = [o for o in others if self._has_moved(o)]
+            if len(others) < 3 or len(moving) < len(others) / 2:
+                continue
+
+            self.flat_alerted.add(sid)
+            alerts.append(self._alert(date, sid, "flatline", flows[sid],
+                                      f"stuck at {flows[sid]} ML/day for {config.FLATLINE_DAYS} days while "
+                                      f"{len(moving)} of {len(others)} other gauges changed"))
         return alerts
 
-    def _check_river(self, date, present):
+    def _check_changes(self, date, flows, changes):
         alerts = []
 
-        # A stuck gauge snapping back is expected, so its first new value becomes the baseline without a check.
-        for sid in present:
-            if (sid, "river_level_m") in self.flat_alerted:
-                self.last_level.pop(sid, None)
-
-        # River levels differ by site, so the daily rise or fall is compared instead of the level itself.
-        changes = {sid: r[1] - self.last_level[sid] for sid, r in present.items() if sid in self.last_level}
-
-        # Sensors under watch are left out of everyone else's comparison, so a drifting gauge can't skew the median.
+        # Gauges under watch are left out of everyone else's comparison, so a drifting gauge can't skew the median.
         trusted = {sid: c for sid, c in changes.items() if sid not in self.drift_alerted}
 
         for sid, change in changes.items():
+            now = to_log(flows[sid])
             others = [c for other, c in trusted.items() if other != sid]
-            level = present[sid][1]
+
+            # A median of fewer than three gauges can be dragged off by a single bad one.
             if len(others) < 3:
-                self.last_level[sid] = level
+                self.last[sid] = now
                 continue
 
             expected = median(others)
             gap = change - expected
 
-            # A drifting sensor is followed without alerts, and released once its recent gaps cancel out.
+            # A drifting gauge is followed without alerts, and released once its recent gaps cancel out.
             if sid in self.drift_alerted:
-                self._add_gap(sid, gap, expected)
-                if abs(sum(self.gaps[sid])) <= self._drift_limit(sid) / 2:
+                self._add_gap(sid, gap)
+                if abs(sum(self.gaps[sid])) <= self.drift_limit[sid] / 2:
                     self.drift_alerted.discard(sid)
                     self.gaps[sid] = []
-                    self.movement[sid] = []
-                self.last_level[sid] = level
+                self.last[sid] = now
                 continue
 
-            if abs(gap) > config.LEVEL_ALERT_M:
-                # A jump that holds the next day is a lasting shift, already reported, so the new level is accepted.
-                raw_change = level - self.last_raw.get(sid, level)
-                if sid in self.jumped and abs(raw_change - expected) <= config.LEVEL_ALERT_M:
+            if abs(gap) > self.jump_limit[sid]:
+                # A jump that holds the next day is a lasting shift, already reported, so the new flow is accepted.
+                raw_change = now - self.last_raw[sid]
+                if sid in self.jumped and abs(raw_change - expected) <= self.jump_limit[sid]:
                     self.jumped.discard(sid)
-                    self.last_level[sid] = level
+                    self.last[sid] = now
                     self.gaps[sid] = []
-                    self.movement[sid] = []
                     continue
 
                 # Otherwise it's flagged, and that value is never trusted as tomorrow's starting point.
                 self.jumped.add(sid)
-                alerts.append(self._alert(date, sid, "river_level_m", level,
-                                          f"changed {change:+.2f} m vs {expected:+.2f} m for the other sensors"))
+                alerts.append(self._alert(date, sid, "jump", flows[sid],
+                                          f"changed {percent(change)} vs {percent(expected)} for the other gauges"))
                 continue
 
             self.jumped.discard(sid)
-            self.last_level[sid] = level
-            self._add_gap(sid, gap, expected)
+            self.last[sid] = now
+            self._add_gap(sid, gap)
 
             # Small daily gaps that keep pointing the same way add up, which is how a slow drift gives itself away.
             drift = sum(self.gaps[sid])
-            if abs(drift) > self._drift_limit(sid):
+            if abs(drift) > self.drift_limit[sid]:
                 self.drift_alerted.add(sid)
-                alerts.append(self._alert(date, sid, "river_level_m", level,
-                                          f"drifted {drift:+.2f} m from the other sensors over "
+                alerts.append(self._alert(date, sid, "drift", flows[sid],
+                                          f"drifted {percent(drift)} from the other gauges over "
                                           f"{len(self.gaps[sid])} days"))
-
-        # Sensors with no baseline yet (first day, or just unstuck) start from today's value.
-        for sid, r in present.items():
-            if sid not in changes and (sid, "river_level_m") not in self.flat_alerted:
-                self.last_level[sid] = r[1]
-            self.last_raw[sid] = r[1]
-
         return alerts
 
-    def _add_gap(self, sid, gap, expected):
-        # Drift is many small steps, so a single big step (a storm or a snap-back) doesn't count towards it.
-        if abs(gap) > config.DRIFT_MAX_STEP:
-            gap = 0.0
-
+    def _add_gap(self, sid, gap):
         # Only the last few days are kept, so old differences can't build up forever.
         self.gaps.setdefault(sid, []).append(gap)
-        self.movement.setdefault(sid, []).append(abs(expected))
         del self.gaps[sid][:-config.DRIFT_DAYS]
-        del self.movement[sid][:-config.DRIFT_DAYS]
-
-    def _drift_limit(self, sid):
-        # Stormy weeks naturally spread the rivers apart, so the limit grows with how much they moved.
-        return config.DRIFT_ALERT_M + config.DRIFT_ALERT_RATIO * sum(self.movement.get(sid, []))
-
-    def check_advisory(self, advisory):
-        """Return a list with one alert if an advisory's source or figures don't hold up, otherwise an empty list."""
-        problems = []
-
-        # Believable figures don't make up for an unknown source, since copying real numbers is how an impersonator works.
-        if advisory["source"] not in config.APPROVED_SOURCES:
-            problems.append(f"source '{advisory['source']}' is not approved")
-
-        # The figures are rebuilt from the readings the detector has seen, using the same maths as the writer.
-        figures = weekly_figures(self.readings_by_date, advisory["period_start"], advisory["period_end"])
-        if figures is None:
-            problems.append("no readings exist for the period it describes")
-        else:
-            rain, change = figures
-            if abs(advisory["avg_rain_mm"] - rain) > config.ADVISORY_RAIN_TOLERANCE_MM:
-                problems.append(f"claims {advisory['avg_rain_mm']:.1f} mm of rain vs {rain:.1f} mm in the readings")
-            if abs(advisory["avg_level_change_m"] - change) > config.ADVISORY_LEVEL_TOLERANCE_M:
-                problems.append(f"claims levels changed {advisory['avg_level_change_m']:+.2f} m "
-                                f"vs {change:+.2f} m in the readings")
-
-        if not problems:
-            return []
-
-        # One alert per advisory, with every problem listed, so a notice that fails both checks isn't counted twice.
-        return [self._alert(advisory["published"], advisory["id"], "advisory", advisory["source"], "; ".join(problems))]
 
     @staticmethod
-    def _alert(date, sensor_id, field, value, reason):
-        return {"date": date, "sensor": sensor_id, "field": field, "value": value, "reason": reason}
+    def _alert(date, sensor_id, rule, value, reason):
+        return {"date": date, "sensor": sensor_id, "rule": rule, "value": value, "reason": reason}

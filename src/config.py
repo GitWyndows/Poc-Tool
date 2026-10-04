@@ -17,7 +17,25 @@ SENSORS = [
 START_DATE = "2026-06-01"
 END_DATE = "2026-08-31"
 
-# The settings below are still set for the old rainfall and river level data until those parts are rebuilt for flow.
+# June is treated as clean and used to learn how much the gauges naturally disagree; checks start the day after.
+LEARN_END = "2026-06-30"
+
+# A day's change is flagged when its gap from the other gauges is 1.5 times the biggest gap seen while learning.
+JUMP_MARGIN = 1.5
+
+# A gauge is flagged as stuck after reporting the exact same value this many days in a row.
+FLATLINE_DAYS = 4
+
+# Other gauges only count as moving if their flow changed by about 5% or more over those days (0.05 in logs).
+FLATLINE_MIN_MOVE = 0.05
+
+# Drift is the total of a gauge's daily gaps from the others over this many days.
+DRIFT_DAYS = 10
+
+# That total is flagged when it's 1.5 times the biggest total seen while learning.
+DRIFT_MARGIN = 1.5
+
+# The settings below are still set for the old rainfall and river-level data, until those parts are rebuilt for flow.
 
 # Planned attacks, only used with --attack. Spikes fake one day, flatlines freeze a sensor, and drift adds a little more each day.
 ATTACKS = [
@@ -28,38 +46,11 @@ ATTACKS = [
     {"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06},
 ]
 
-# Rainfall is flagged when it differs from the other sensors by more than 10 mm AND by more than 75% of their median.
-RAIN_ALERT_MM = 10.0
-RAIN_ALERT_RATIO = 0.75
-
-# A river level is flagged when its daily change differs from the other sensors' by more than 0.5 m.
-LEVEL_ALERT_M = 0.5
-
-# A sensor is flagged as stuck after reporting the exact same value this many days in a row.
-FLATLINE_DAYS = 4
-
-# Other sensors only count as moving if they changed by at least this much, so drizzle or 1 cm wobbles don't count.
-FLATLINE_MIN_MOVE = {"rainfall_mm": 1.0, "river_level_m": 0.05}
-
-# Drift is measured over this many days of small gaps between a sensor and the others.
-DRIFT_DAYS = 10
-
-# Daily gaps bigger than this are one-off steps rather than creep, so they're left out of the drift total.
-DRIFT_MAX_STEP = 0.2
-
-# The drift limit starts at 0.3 m and grows by a quarter of how far the rivers moved in that time.
-DRIFT_ALERT_M = 0.3
-DRIFT_ALERT_RATIO = 0.25
-
 # Advisories from any other source are treated as untrustworthy, however believable their figures.
 APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]
 
 # A genuine advisory is published every this many days, covering the days since the last one.
 ADVISORY_EVERY_DAYS = 7
-
-# An advisory's figures may differ from the readings by this much, which covers rounding with room to spare.
-ADVISORY_RAIN_TOLERANCE_MM = 0.2
-ADVISORY_LEVEL_TOLERANCE_M = 0.02
 
 # Planned fake advisories, only used with --attack. Fake figures pose as an approved source with made-up numbers,
 # while a fake source quotes the real numbers under a name that isn't approved.

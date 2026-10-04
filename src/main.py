@@ -1,11 +1,11 @@
-"""Reads the DWER streamflow CSV and prints each day's flow for the five gauges.
+"""Replays the DWER streamflow CSV day by day, printing each gauge's flow and any alerts from the detector.
 
     python src/main.py                 # all 92 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
 
 The data file is checked strictly before anything runs, so a gap or typo stops the tool instead of
-quietly skewing the results.
+quietly skewing the results. June is spent learning how the gauges normally behave, and checks start in July.
 """
 import argparse
 import csv
@@ -15,6 +15,7 @@ import time
 from datetime import date, timedelta
 
 import config
+from detection import Detector
 from sensor import Sensor
 
 HEADER = ["date", "sensor_id", "flow_ml"]
@@ -94,24 +95,47 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
-def print_day(day_number, day, sensors):
+def print_day(day_number, day, sensors, alerts):
     # Fixed column widths keep the table lined up however long each value is.
-    print(f"\nDay {day_number}  |  {day}")
+    learning = "  |  learning" if day <= config.LEARN_END else ""
+    print(f"\nDay {day_number}  |  {day}{learning}")
     print(f"{'Gauge':<8}{'Name':<32}{'Flow (ML/day)':>15}")
     print("-" * 55)
 
     for s in sensors:
         print(f"{s.id:<8}{s.name:<32}{s.read(day):>15.2f}")
 
+    for a in alerts:
+        print(f"  ALERT {a['sensor']} {a['rule']}: {a['reason']}")
+
+
+def print_summary(detector, sensors, alerts):
+    """Show the limits learned in June and how many alerts were raised, so a clean run can be told from a quiet one."""
+    if not detector.jump_limit:
+        print(f"\nStill learning, so nothing was checked. Checks start after {config.LEARN_END}.")
+        return
+
+    # Limits are shown as how many times bigger or smaller a change can be than the others' before it's flagged.
+    print(f"\nLimits learned from {config.START_DATE} to {config.LEARN_END}")
+    print(f"{'Gauge':<8}{'Name':<32}{'Jump':>8}{'Drift':>8}")
+    print("-" * 56)
+    for s in sensors:
+        jump, drift = math.exp(detector.jump_limit[s.id]), math.exp(detector.drift_limit[s.id])
+        print(f"{s.id:<8}{s.name:<32}{f'x{jump:.2f}':>8}{f'x{drift:.2f}':>8}")
+
+    print(f"\n{len(alerts)} alert(s) raised")
+
 
 def main():
     # argparse handles the options and builds the --help message for free.
-    parser = argparse.ArgumentParser(description="Print daily streamflow for the five DWER gauges.")
+    parser = argparse.ArgumentParser(description="Replay daily streamflow for the five DWER gauges and check it.")
     parser.add_argument("--days", type=int, help="Only show this many days")
     parser.add_argument("--delay", type=float, default=0, help="Seconds to wait between days")
     args = parser.parse_args()
 
     sensors, dates = load_sensors()
+    detector = Detector()
+    all_alerts = []
 
     # Note that --days 0 counts as not set, so it shows every day.
     shown_dates = dates[:args.days] if args.days else dates
@@ -120,11 +144,15 @@ def main():
 
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
     for i, day in enumerate(shown_dates, start=1):
-        print_day(i, day, sensors)
+        alerts = detector.check_day(day, {s.id: s.read(day) for s in sensors})
+        all_alerts += alerts
+        print_day(i, day, sensors, alerts)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:
             time.sleep(args.delay)
+
+    print_summary(detector, sensors, all_alerts)
 
 
 # Runs only when the file is executed directly rather than imported.

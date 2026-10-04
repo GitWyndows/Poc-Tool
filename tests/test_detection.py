@@ -1,308 +1,207 @@
 """Tests for detection.py, using small hand-made days instead of the CSV."""
+import math
+from datetime import date, timedelta
+
+import pytest
+
 import config
-from advisories import AdvisoryWriter, make_advisory
-from detection import Detector
+from detection import Detector, percent
 
-SENSORS = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"]
-
-
-def day(rain, level=1.0, **overrides):
-    """Build one day of readings where every sensor matches, apart from any overrides."""
-    readings = {sid: (rain, level) for sid in SENSORS}
-    readings.update(overrides)
-    return readings
+GAUGES = ["A", "B", "C", "D", "E"]
 
 
-def flagged(alerts):
-    return {(a["sensor"], a["field"]) for a in alerts}
+def day(flow=100.0, **overrides):
+    """Build one day of flows where every gauge matches, apart from any overrides."""
+    flows = {sid: flow for sid in GAUGES}
+    flows.update(overrides)
+    return flows
 
 
-# Rainfall
+def learning_days(wobble=1.1, jumpy=None, sizes=None):
+    """Thirty June days where one gauge at a time reads 10% high, so every gauge learns the same small limits."""
+    days = []
+    for i in range(30):
+        # A tiny steady rise, since real flows never repeat exactly and a repeat would look like a stuck gauge.
+        base = 100.0 + 0.01 * i
+        flows = {sid: round(base * (sizes or {}).get(sid, 100.0) / 100, 2) for sid in GAUGES}
 
-def test_big_rain_spike_on_dry_day_is_flagged():
-    alerts = Detector().check_day("d1", day(0.0, S3=(80.0, 1.0)))
-    assert flagged(alerts) == {("S3", "rainfall_mm")}
+        # A 7-day cycle (five gauges, then two calm days) so a 10-day drift window never cancels out exactly.
+        if i % 7 < 5:
+            sid = GAUGES[i % 7]
+            flows[sid] = round(flows[sid] * wobble, 2)
 
-
-def test_rain_hidden_on_wet_day_is_flagged():
-    # Faking 0 mm while everyone else got 30 mm is as suspicious as a spike.
-    alerts = Detector().check_day("d1", day(30.0, S3=(0.0, 1.0)))
-    assert flagged(alerts) == {("S3", "rainfall_mm")}
-
-
-def test_normal_spread_on_heavy_day_is_not_flagged():
-    # Sensors differ by up to 30% on real rainy days, which must not raise alerts.
-    readings = {"S1": (24.0, 1.0), "S2": (28.0, 1.0), "S3": (39.0, 1.0), "S4": (31.0, 1.0),
-                "S5": (26.0, 1.0), "S6": (35.0, 1.0), "S7": (30.0, 1.0), "S8": (33.0, 1.0)}
-    assert Detector().check_day("d1", readings) == []
-
-
-def test_small_spike_gets_through():
-    # A known limitation: a fake value under the 10 mm limit is not caught.
-    alerts = Detector().check_day("d1", day(0.0, S3=(8.0, 1.0)))
-    assert alerts == []
+        # A jumpy gauge also swings 50% on alternate days, so it should learn a wider limit than the rest.
+        if jumpy and i % 2:
+            flows[jumpy] = round(flows[jumpy] * 1.5, 2)
+        days.append(flows)
+    return days
 
 
-def test_alert_explains_itself():
-    alerts = Detector().check_day("d1", day(0.0, S3=(80.0, 1.0)))
-    assert alerts[0]["reason"] == "80.0 mm vs 0.0 mm from the other sensors"
-
-
-# River level
-
-def test_river_level_is_not_checked_on_the_first_day():
-    # There's no yesterday to compare against yet.
-    alerts = Detector().check_day("d1", day(0.0, S5=(0.0, 3.2)))
-    assert alerts == []
-
-
-def test_river_jump_is_flagged():
-    detector = Detector()
-    detector.check_day("d1", day(0.0, level=1.0))
-    alerts = detector.check_day("d2", day(0.0, level=0.98, S5=(0.0, 2.5)))
-
-    assert flagged(alerts) == {("S5", "river_level_m")}
-
-
-def test_sensors_at_different_heights_are_not_flagged():
-    # Only the daily change is compared, so a river that always sits higher is fine.
-    detector = Detector()
-    detector.check_day("d1", day(0.0, level=1.0, S5=(0.0, 3.0)))
-    alerts = detector.check_day("d2", day(0.0, level=0.98, S5=(0.0, 2.98)))
-
-    assert alerts == []
-
-
-def test_all_rivers_rising_together_is_not_flagged():
-    detector = Detector()
-    detector.check_day("d1", day(0.0, level=1.0))
-    alerts = detector.check_day("d2", day(40.0, level=1.8))
-
-    assert alerts == []
-
-
-def test_flagged_level_is_not_used_as_the_next_baseline():
-    # Without this, S5 dropping back to normal would look like a second attack.
-    detector = Detector()
-    detector.check_day("d1", day(0.0, level=1.0))
-    detector.check_day("d2", day(0.0, level=0.99, S5=(0.0, 3.2)))
-    alerts = detector.check_day("d3", day(0.0, level=0.98))
-
-    assert alerts == []
-
-
-# Missing data
-
-def test_missing_reading_is_skipped_not_crashed():
-    alerts = Detector().check_day("d1", day(0.0, S2=None, S3=(80.0, 1.0)))
-    assert flagged(alerts) == {("S3", "rainfall_mm")}
-
-
-def test_too_few_sensors_means_no_checks():
-    # With fewer than three others to compare against, a single bad sensor could fool the median.
-    readings = {"S1": (0.0, 1.0), "S2": (0.0, 1.0), "S3": (80.0, 1.0)}
-    assert Detector().check_day("d1", readings) == []
-
-
-# Flatline
-
-def run_days(detector, days):
-    """Feed several days through one detector and return every alert raised."""
+def run(detector, days, start="2026-07-01"):
+    """Feed days to the detector from `start`, returning every alert raised."""
+    first = date.fromisoformat(start)
     alerts = []
-    for i, readings in enumerate(days):
-        alerts += detector.check_day(f"d{i + 1}", readings)
+    for i, flows in enumerate(days):
+        alerts += detector.check_day((first + timedelta(days=i)).isoformat(), flows)
     return alerts
 
 
-def test_stuck_river_gauge_is_flagged_on_the_fourth_day():
-    # The other rivers fall 5 cm a day while S7 stays at 2.00.
-    days = [day(0.0, level=2.0 - 0.05 * i, S7=(0.0, 2.0)) for i in range(config.FLATLINE_DAYS)]
-    alerts = run_days(Detector(), days)
-
-    assert flagged(alerts) == {("S7", "river_level_m")}
-    assert alerts[0]["date"] == f"d{config.FLATLINE_DAYS}"
+def flagged(alerts):
+    return {(a["sensor"], a["rule"]) for a in alerts}
 
 
-def test_stuck_sensor_is_only_flagged_once():
-    days = [day(0.0, level=2.0 - 0.05 * i, S7=(0.0, 2.0)) for i in range(8)]
-    alerts = run_days(Detector(), days)
+@pytest.fixture
+def detector():
+    """A detector that has already learned from a calm June."""
+    d = Detector()
+    run(d, learning_days(), start="2026-06-01")
+    return d
 
+
+# Learning
+
+def test_nothing_is_flagged_while_learning():
+    # June is assumed clean, so even a wild value or a stuck gauge only shapes what's learned.
+    days = learning_days()
+    days[10]["C"] = 900.0
+    for flows in days[14:22]:
+        flows["D"] = 50.0
+    assert run(Detector(), days, start="2026-06-01") == []
+
+
+def test_limits_come_from_the_biggest_june_gap(detector):
+    run(detector, [day()])
+
+    # Each wobble is a 10% gap, so the jump limit is 1.5 times that, measured in logs.
+    expected = config.JUMP_MARGIN * math.log(111 / 101)
+    assert detector.jump_limit["A"] == pytest.approx(expected, rel=0.001)
+
+
+def test_a_jumpy_gauge_learns_a_wider_limit():
+    d = Detector()
+    run(d, learning_days(jumpy="C"), start="2026-06-01")
+    run(d, [day()])
+
+    assert d.jump_limit["C"] > 2 * d.jump_limit["A"]
+
+
+def test_checks_refuse_to_start_without_learning():
+    with pytest.raises(ValueError, match="needs at least 11 days of learning"):
+        Detector().check_day("2026-07-01", day())
+
+
+def test_july_with_the_same_wobble_as_june_is_not_flagged(detector):
+    assert run(detector, learning_days()) == []
+
+
+# Jumps
+
+def test_one_day_spike_is_flagged(detector):
+    alerts = run(detector, [day(), day(C=300.0)])
+    assert flagged(alerts) == {("C", "jump")}
+
+
+def test_alert_explains_itself(detector):
+    [alert] = run(detector, [day(), day(C=300.0)])
+
+    # 100 to 300 is +200%, and the +1 that lets a dry stream read zero nudges it slightly.
+    assert alert["reason"] == "changed +198% vs +0% for the other gauges"
+    assert alert["value"] == 300.0
+
+
+def test_all_gauges_rising_together_is_not_flagged(detector):
+    # A storm lifts every stream at once, which is real.
+    assert run(detector, [day(), day(300.0)]) == []
+
+
+def test_gauges_of_different_sizes_rising_by_the_same_share_are_not_flagged():
+    # A small brook and a big river both up 50% is the same news, even though one gained 150 ML/day and the other 5.
+    sizes = {"A": 10.0, "B": 40.0, "C": 100.0, "D": 200.0, "E": 300.0}
+    d = Detector()
+    run(d, learning_days(sizes=sizes), start="2026-06-01")
+
+    assert run(d, [sizes, {sid: f * 1.5 for sid, f in sizes.items()}]) == []
+
+
+def test_small_fake_change_gets_through(detector):
+    # A known limitation: a change inside the learned limit (here about +15%) is not caught.
+    assert run(detector, [day(), day(C=112.0)]) == []
+
+
+def test_snapping_back_after_a_spike_is_not_flagged(detector):
+    # The spiked value is never trusted, so the next real value is compared with the day before the spike.
+    alerts = run(detector, [day(), day(C=300.0), day()])
     assert len(alerts) == 1
 
 
-def test_whole_area_dry_week_is_not_a_flatline():
-    # Every gauge reading 0 mm for a week is just a dry week.
-    alerts = run_days(Detector(), [day(0.0, level=1.0 - 0.05 * i) for i in range(6)])
-    assert alerts == []
+def test_lasting_shift_is_flagged_once(detector):
+    alerts = run(detector, [day(), day(C=300.0), day(C=300.0), day(C=300.0)])
+    assert [a["date"] for a in alerts] == ["2026-07-02"]
 
 
-def test_drizzle_in_other_sensors_does_not_count_as_moving():
-    # 0.1 mm differences are gauge noise, not a sign that S1 is stuck.
-    days = [day(0.0, level=1.0 - 0.05 * i) for i in range(3)]
-    days.append(day(0.1, level=0.85, S1=(0.0, 0.85)))
-    assert run_days(Detector(), days) == []
+def test_faked_dry_stream_is_flagged(detector):
+    # Zero flow works with the logs, so a gauge faking a stopped stream is caught rather than crashing.
+    alerts = run(detector, [day(), day(C=0.0)])
+    assert flagged(alerts) == {("C", "jump")}
 
 
-def test_stuck_rain_gauge_during_rain_is_flagged():
-    # Others get varied rain while S2 keeps reporting 3.0 mm.
-    rain = [2.0, 6.0, 4.0, 9.0]
-    days = [day(r, level=1.0 + 0.05 * i, S2=(3.0, 1.0 + 0.05 * i)) for i, r in enumerate(rain)]
-    alerts = run_days(Detector(), days)
+# Flatlines
 
-    assert ("S2", "rainfall_mm") in flagged(alerts)
+def moving_days(n, stuck=None):
+    """Days where every gauge falls 5% a day, with `stuck` frozen at 100 if given."""
+    return [{sid: 100.0 if sid == stuck else round(100.0 * 0.95 ** i, 2) for sid in GAUGES} for i in range(n)]
 
 
-def test_stuck_gauge_snapping_back_is_not_a_river_jump():
-    # S7 is frozen at 2.00 while the others fall, then drops 0.75 m back to its real level.
-    days = [day(0.0, level=2.0 - 0.15 * i, S7=(0.0, 2.0)) for i in range(5)]
-    days.append(day(0.0, level=1.25, S7=(0.0, 1.25)))
-    alerts = run_days(Detector(), days)
+def test_stuck_gauge_is_flagged_once(detector):
+    alerts = run(detector, moving_days(8, stuck="D"))
+    assert flagged(alerts) == {("D", "flatline")}
+    assert alerts[0]["date"] == "2026-07-04"
 
-    assert [a["field"] for a in alerts] == ["river_level_m"]
-    assert "stuck" in alerts[0]["reason"]
+
+def test_stuck_while_every_stream_is_steady_is_not_flagged(detector):
+    # In a long dry spell every gauge can sit still, and nothing has gone wrong.
+    assert run(detector, [day()] * 8) == []
+
+
+def test_unstuck_gauge_does_not_raise_a_jump(detector):
+    days = moving_days(6, stuck="D") + moving_days(8)[6:]
+    alerts = run(detector, days)
+    assert flagged(alerts) == {("D", "flatline")}
 
 
 # Drift
 
-def drifting_days(total, rate, start=2, others_fall=0.02, **extra):
-    """Others fall steadily while S2 creeps away by `rate` a day from day `start` onwards."""
-    days = []
-    for i in range(total):
-        base = 2.0 - others_fall * i
-        offset = rate * max(0, i - start + 1)
-        days.append(day(0.0, level=round(base, 2), S2=(0.0, round(base + offset, 2)), **extra))
-    return days
+def drifting_days(n, rate):
+    """Days where gauge B creeps up by `rate` (e.g. 0.05 for 5%) more each day than the others."""
+    return [day(B=round(100.0 * (1 + rate) ** (i + 1), 2)) for i in range(n)]
 
 
-def test_steady_drift_is_flagged_once():
-    alerts = run_days(Detector(), drifting_days(14, 0.06))
-
-    assert [(a["sensor"], a["field"]) for a in alerts] == [("S2", "river_level_m")]
-    assert "drifted" in alerts[0]["reason"]
-
-
-def test_drift_is_too_small_for_the_daily_jump_rule():
-    # Each day's step is only 0.06 m, far below the 0.5 m jump limit, so only the drift rule sees it.
-    days = drifting_days(14, 0.06)
-    alerts = run_days(Detector(), days)
-
-    assert "changed" not in alerts[0]["reason"]
+def test_slow_drift_is_flagged(detector):
+    # Each step stays well inside the jump limit, but they add up.
+    alerts = run(detector, drifting_days(14, 0.05))
+    assert flagged(alerts) == {("B", "drift")}
+    assert alerts[0]["reason"].startswith("drifted +")
 
 
-def test_small_random_differences_are_not_drift():
-    # S2 wobbles 5 cm either side of the others, which cancels out over time.
-    days = [day(0.0, level=2.0 - 0.02 * i, S2=(0.0, 2.0 - 0.02 * i + (0.05 if i % 2 else -0.05)))
-            for i in range(14)]
-    assert run_days(Detector(), days) == []
-
-
-def test_one_big_step_is_not_counted_as_drift():
-    # A single 0.4 m step is under the jump limit, and one step isn't creep, so nothing is raised.
-    days = [day(0.0, level=2.0 - 0.02 * i, S2=(0.0, 2.0 - 0.02 * i + (0.4 if i >= 3 else 0.0)))
-            for i in range(14)]
-    assert run_days(Detector(), days) == []
-
-
-def test_drifting_sensor_snapping_back_is_not_flagged_again():
-    days = drifting_days(12, 0.08)
-    # On day 13 S2 drops straight back into line with the others.
-    days.append(day(0.0, level=round(2.0 - 0.02 * 12, 2)))
-    days.append(day(0.0, level=round(2.0 - 0.02 * 13, 2)))
-    alerts = run_days(Detector(), days)
-
+def test_drifting_gauge_is_only_flagged_once(detector):
+    alerts = run(detector, drifting_days(20, 0.05))
     assert len(alerts) == 1
 
 
-def test_lasting_level_shift_is_only_flagged_once():
-    # S5 jumps 0.8 m and stays there, as if the gauge had been moved, which is reported once and then accepted.
-    days = [day(0.0, level=2.0 - 0.02 * i, S5=(0.0, 2.0 - 0.02 * i + (0.8 if i >= 3 else 0.0)))
-            for i in range(10)]
-    alerts = run_days(Detector(), days)
-
-    assert len(alerts) == 1
-    assert "changed" in alerts[0]["reason"]
+def test_drifting_gauge_is_released_once_back_in_line(detector):
+    # After the snap-back, the same gauge drifting again later is a new alert.
+    days = drifting_days(10, 0.05) + [day()] * 12 + drifting_days(10, 0.05)
+    alerts = run(detector, days)
+    assert [a["rule"] for a in alerts] == ["drift", "drift"]
 
 
-# Advisories
-
-def seen_week(detector, **overrides):
-    """Feed the detector a week where every sensor gets 2 mm a day and the rivers fall 1 cm a day."""
-    for i in range(7):
-        detector.check_day(f"2026-06-{i + 1:02d}", day(2.0, level=round(1.0 - 0.01 * i, 2), **overrides))
+def test_very_slow_drift_gets_through(detector):
+    # A known limitation: 1% a day stays inside the learned drift limit for the 10-day window.
+    assert run(detector, drifting_days(20, 0.01)) == []
 
 
-def advisory(source="Water Corporation", rain=14.0, change=-0.06, start="2026-06-01", end="2026-06-07"):
-    return make_advisory("ADV-T", end, start, end, source, rain, change)
+# Percentages
 
-
-def test_advisory_matching_the_readings_passes():
-    detector = Detector()
-    seen_week(detector)
-    assert detector.check_advisory(advisory()) == []
-
-
-def test_every_genuine_advisory_from_the_writer_passes():
-    detector, writer = Detector(), AdvisoryWriter()
-    for i in range(14):
-        readings = day(float(i % 3), level=round(1.0 + 0.02 * (i % 4), 2))
-        date = f"2026-06-{i + 1:02d}"
-        detector.check_day(date, readings)
-        published = writer.record(date, readings)
-        if published:
-            assert detector.check_advisory(published) == []
-
-
-def test_unapproved_source_is_flagged_even_with_correct_figures():
-    detector = Detector()
-    seen_week(detector)
-    alerts = detector.check_advisory(advisory(source="WA Water Watch"))
-
-    assert len(alerts) == 1
-    assert alerts[0]["reason"] == "source 'WA Water Watch' is not approved"
-
-
-def test_wrong_rainfall_is_flagged():
-    detector = Detector()
-    seen_week(detector)
-    [alert] = detector.check_advisory(advisory(rain=3.0))
-    assert "claims 3.0 mm of rain vs 14.0 mm" in alert["reason"]
-
-
-def test_wrong_level_change_is_flagged():
-    detector = Detector()
-    seen_week(detector)
-    [alert] = detector.check_advisory(advisory(change=-0.5))
-    assert "claims levels changed -0.50 m vs -0.06 m" in alert["reason"]
-
-
-def test_several_problems_give_one_alert_listing_them_all():
-    detector = Detector()
-    seen_week(detector)
-    alerts = detector.check_advisory(advisory(source="WA Water Watch", rain=3.0, change=-0.5))
-
-    assert len(alerts) == 1
-    assert alerts[0]["reason"].count(";") == 2
-
-
-def test_small_rounding_differences_are_allowed():
-    detector = Detector()
-    seen_week(detector)
-    assert detector.check_advisory(advisory(rain=14.1, change=-0.07)) == []
-
-
-def test_advisory_about_days_with_no_readings_is_flagged():
-    detector = Detector()
-    seen_week(detector)
-    [alert] = detector.check_advisory(advisory(start="2026-07-01", end="2026-07-07"))
-    assert "no readings" in alert["reason"]
-
-
-def test_advisory_matching_tampered_readings_passes():
-    # A known limitation: the checker can only compare against what the sensors report, so if S3 is faking
-    # 20 mm a day, an advisory quoting those figures looks consistent and is not flagged.
-    detector = Detector()
-    seen_week(detector, S3=(20.0, 1.0))
-    tampered_rain = (7 * 14.0 + 7 * 20.0) / 8
-    tampered_change = -0.06 * 7 / 8
-
-    assert detector.check_advisory(advisory(rain=tampered_rain, change=tampered_change)) == []
+@pytest.mark.parametrize("log_change, text", [(0.0, "+0%"), (math.log(2), "+100%"), (math.log(0.5), "-50%")])
+def test_percent_turns_logs_into_plain_changes(log_change, text):
+    assert percent(log_change) == text
