@@ -35,16 +35,18 @@ DRIFT_DAYS = 10
 # That total is flagged when it's 1.5 times the biggest total seen while learning.
 DRIFT_MARGIN = 1.5
 
-# The settings below are still set for the old rainfall and river-level data, until those parts are rebuilt for flow.
-
-# Planned attacks, only used with --attack. Spikes fake one day, flatlines freeze a sensor, and drift adds a little more each day.
+# Planned attacks, only used with --attack, all after learning so June stays clean. A spike multiplies one day's flow,
+# a flatline freezes a gauge, and drift adds the same percentage on top of the last each day.
 ATTACKS = [
-    {"type": "spike", "sensor": "S3", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0},
-    {"type": "spike", "sensor": "S6", "date": "2026-07-15", "field": "rainfall_mm", "value": 45.0},
-    {"type": "spike", "sensor": "S5", "date": "2026-08-10", "field": "river_level_m", "value": 3.20},
-    {"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 7, "field": "river_level_m"},
-    {"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06},
+    {"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.0},
+    {"type": "spike", "sensor": "607013", "date": "2026-08-05", "factor": 0.5},
+    {"type": "spike", "sensor": "608002", "date": "2026-08-20", "factor": 1.5},
+    {"type": "flatline", "sensor": "608002", "start": "2026-07-22", "days": 7},
+    {"type": "drift", "sensor": "607022", "start": "2026-08-08", "days": 14, "rate": 0.10},
+    {"type": "drift", "sensor": "608151", "start": "2026-07-27", "days": 14, "rate": 0.05},
 ]
+
+# The settings below are still set for the old rainfall and river-level advisories, until those are rebuilt for flow.
 
 # Advisories from any other source are treated as untrustworthy, however believable their figures.
 APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]

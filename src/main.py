@@ -3,6 +3,7 @@
     python src/main.py                 # all 92 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
+    python src/main.py --attack        # apply the attacks planned in config.py, then score the detector
 
 The data file is checked strictly before anything runs, so a gap or typo stops the tool instead of
 quietly skewing the results. June is spent learning how the gauges normally behave, and checks start in July.
@@ -15,6 +16,7 @@ import time
 from datetime import date, timedelta
 
 import config
+from attacks import Attacker, describe, score
 from detection import Detector
 from sensor import Sensor
 
@@ -95,22 +97,25 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
-def print_day(day_number, day, sensors, alerts):
+def print_day(day_number, day, sensors, flows, alerts):
     # Fixed column widths keep the table lined up however long each value is.
     learning = "  |  learning" if day <= config.LEARN_END else ""
     print(f"\nDay {day_number}  |  {day}{learning}")
     print(f"{'Gauge':<8}{'Name':<32}{'Flow (ML/day)':>15}")
     print("-" * 55)
 
+    # The flows shown are the ones the detector saw, so a tampered value appears exactly as a defender would see it.
+    flagged = {a["sensor"] for a in alerts}
     for s in sensors:
-        print(f"{s.id:<8}{s.name:<32}{s.read(day):>15.2f}")
+        mark = "  <-- ALERT" if s.id in flagged else ""
+        print(f"{s.id:<8}{s.name:<32}{flows[s.id]:>15.2f}{mark}")
 
     for a in alerts:
         print(f"  ALERT {a['sensor']} {a['rule']}: {a['reason']}")
 
 
-def print_summary(detector, sensors, alerts):
-    """Show the limits learned in June and how many alerts were raised, so a clean run can be told from a quiet one."""
+def print_limits(detector, sensors):
+    """Show the limits learned in June, so it's clear how big a change has to be before it's flagged."""
     if not detector.jump_limit:
         print(f"\nStill learning, so nothing was checked. Checks start after {config.LEARN_END}.")
         return
@@ -123,7 +128,49 @@ def print_summary(detector, sensors, alerts):
         jump, drift = math.exp(detector.jump_limit[s.id]), math.exp(detector.drift_limit[s.id])
         print(f"{s.id:<8}{s.name:<32}{f'x{jump:.2f}':>8}{f'x{drift:.2f}':>8}")
 
-    print(f"\n{len(alerts)} alert(s) raised")
+
+def print_attack_log(attacker):
+    # Printed only at the end, so the daily tables look exactly as a defender would see them.
+    print("\n" + "=" * 56)
+    print("ATTACK LOG (ground truth)")
+    print("=" * 56)
+
+    # Grouped by attack, so a week-long flatline reads as one entry rather than seven.
+    for attack_id, attack in enumerate(attacker.plan):
+        entries = [e for e in attacker.log if e["attack"] == attack_id]
+        if not entries:
+            print(f"Skipped: {describe(attack)} falls outside the days shown.")
+            continue
+
+        first, last = entries[0], entries[-1]
+        if attack["type"] == "spike":
+            detail = f"real {first['real']:.2f} -> fake {first['fake']:.2f} ML/day"
+        elif attack["type"] == "drift":
+            detail = f"{last['fake'] / last['real'] - 1:+.0%} off by the last day"
+        else:
+            detail = f"frozen at {first['fake']:.2f} ML/day for {len(entries)} days"
+        print(f"{describe(attack)}: {detail}")
+
+
+def print_score(alerts, attacker):
+    caught, caught_late, missed, false_alarms = score(alerts, attacker)
+    ran = len(caught) + len(caught_late) + len(missed)
+
+    print("\n" + "=" * 56)
+    print("DETECTION SCORE")
+    print("=" * 56)
+    print(f"Attacks caught:  {len(caught)} of {ran}")
+    print(f"Caught late:     {len(caught_late)}  (only noticed when the attack stopped)")
+    print(f"Attacks missed:  {len(missed)}")
+    print(f"False alarms:    {len(false_alarms)}")
+
+    # Listing them by name shows exactly where a rule needs work.
+    for attack in caught_late:
+        print(f"  LATE         {describe(attack)}")
+    for attack in missed:
+        print(f"  MISSED       {describe(attack)}")
+    for day, sensor in false_alarms:
+        print(f"  FALSE ALARM  {day}  {sensor}")
 
 
 def main():
@@ -131,9 +178,13 @@ def main():
     parser = argparse.ArgumentParser(description="Replay daily streamflow for the five DWER gauges and check it.")
     parser.add_argument("--days", type=int, help="Only show this many days")
     parser.add_argument("--delay", type=float, default=0, help="Seconds to wait between days")
+    parser.add_argument("--attack", action="store_true", help="Apply the attacks planned in config.py")
     args = parser.parse_args()
 
     sensors, dates = load_sensors()
+
+    # Attacks are opt-in so a clean run is always available to compare against.
+    attacker = Attacker(config.ATTACKS if args.attack else [])
     detector = Detector()
     all_alerts = []
 
@@ -144,15 +195,20 @@ def main():
 
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
     for i, day in enumerate(shown_dates, start=1):
-        alerts = detector.check_day(day, {s.id: s.read(day) for s in sensors})
+        # Every reading passes through the attacker first, and the detector sees only what comes out, never the log.
+        flows = {s.id: attacker.apply(s.id, day, s.read(day)) for s in sensors}
+        alerts = detector.check_day(day, flows)
         all_alerts += alerts
-        print_day(i, day, sensors, alerts)
+        print_day(i, day, sensors, flows, alerts)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:
             time.sleep(args.delay)
 
-    print_summary(detector, sensors, all_alerts)
+    print_limits(detector, sensors)
+    if args.attack:
+        print_attack_log(attacker)
+    print_score(all_alerts, attacker)
 
 
 # Runs only when the file is executed directly rather than imported.

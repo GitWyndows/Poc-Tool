@@ -1,4 +1,4 @@
-"""Tests for main.py: strict loading of the streamflow CSV, printing it, and checking it with the detector."""
+"""Tests for main.py: strict loading of the streamflow CSV, printing it, checking it, and scoring attacks."""
 import sys
 
 import pytest
@@ -120,9 +120,14 @@ def test_zero_flow_is_allowed(tmp_path, monkeypatch):
 
 # Printing
 
+def flows_on(sensors, day):
+    """Each gauge's real flow on one day, as the detector would see it with no attacks."""
+    return {s.id: s.read(day) for s in sensors}
+
+
 def test_print_day_shows_every_gauge_and_its_flow(capsys):
     sensors, dates = main.load_sensors()
-    main.print_day(1, dates[0], sensors, [])
+    main.print_day(1, dates[0], sensors, flows_on(sensors, dates[0]), [])
     out = capsys.readouterr().out
 
     assert "Day 1  |  2026-06-01  |  learning" in out
@@ -130,14 +135,16 @@ def test_print_day_shows_every_gauge_and_its_flow(capsys):
     assert "Lefroy Brook - Cascades" in out and "66.35" in out
 
 
-def test_print_day_shows_alerts_and_drops_the_learning_label(capsys):
+def test_print_day_shows_the_flows_as_seen_and_marks_alerts(capsys):
     sensors, _ = main.load_sensors()
-    alert = {"date": "2026-07-15", "sensor": "608171", "rule": "jump", "value": 500.0, "reason": "changed +300%"}
-    main.print_day(45, "2026-07-15", sensors, [alert])
+    flows = {**flows_on(sensors, "2026-07-15"), "608171": 99.96}
+    alert = {"date": "2026-07-15", "sensor": "608171", "rule": "jump", "value": 99.96, "reason": "changed +152%"}
+    main.print_day(45, "2026-07-15", sensors, flows, [alert])
     out = capsys.readouterr().out
 
     assert "Day 45  |  2026-07-15\n" in out
-    assert "ALERT 608171 jump: changed +300%" in out
+    assert "99.96  <-- ALERT" in out
+    assert "ALERT 608171 jump: changed +152%" in out
 
 
 def test_days_option_limits_the_output(monkeypatch, capsys):
@@ -166,5 +173,37 @@ def test_clean_real_data_raises_no_alerts(monkeypatch, capsys):
     out = capsys.readouterr().out
 
     assert "ALERT" not in out
-    assert out.rstrip().endswith("0 alert(s) raised")
+    assert "False alarms:    0" in out
     assert "Limits learned from 2026-06-01 to 2026-06-30" in out
+    assert "ATTACK LOG" not in out
+
+
+# Attacks
+
+def test_attack_run_logs_and_scores_the_planned_attacks(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--attack"])
+    main.main()
+    out = capsys.readouterr().out
+
+    # The planned attacks are chosen to show both what the detector catches and where it falls short.
+    assert "spike on 608171 of x3.0 on 2026-07-15: real 33.32 -> fake 99.96 ML/day" in out
+    assert "Attacks caught:  4 of 6" in out
+    assert "LATE         drift on 608151" in out
+    assert "MISSED       spike on 608002 of x1.5" in out
+    assert "False alarms:    0" in out
+
+
+def test_attacks_after_the_days_shown_are_reported_as_skipped(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--attack", "--days", "50"])
+    main.main()
+    out = capsys.readouterr().out
+
+    assert "Skipped: spike on 607013 of x0.5 on 2026-08-05 falls outside the days shown." in out
+    assert "Attacks caught:  1 of 1" in out
+
+
+def test_bad_attack_plan_stops_before_anything_runs(monkeypatch):
+    monkeypatch.setattr(config, "ATTACKS", [{"type": "spike", "sensor": "S3", "date": "2026-07-15", "factor": 3.0}])
+    monkeypatch.setattr(sys, "argv", ["main.py", "--attack"])
+    with pytest.raises(ValueError, match="'S3' is not one of the gauges"):
+        main.main()
