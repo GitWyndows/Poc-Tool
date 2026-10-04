@@ -1,210 +1,148 @@
-"""Tests for main.py: loading, printing, scoring, and full runs from start to finish."""
+"""Tests for main.py: strict loading of the streamflow CSV, and printing it."""
 import sys
 
 import pytest
 
 import config
-import generate_data
 import main
-from advisories import AdvisoryWriter
-from attacks import Attacker
-from detection import Detector
+
+IDS = [sid for sid, _ in config.SENSORS]
 
 
-@pytest.fixture
-def data_file(tmp_path, monkeypatch):
-    """Generate a fresh CSV in a temporary folder, so tests never touch the real data file."""
-    path = tmp_path / "readings.csv"
+def write_csv(tmp_path, monkeypatch, rows, header="date,sensor_id,flow_ml"):
+    """Write a CSV to a temporary folder and point the tool at it, so tests never touch the real file."""
+    path = tmp_path / "flow.csv"
+    path.write_text("\n".join([header] + rows) + "\n")
     monkeypatch.setattr(config, "DATA_FILE", path)
-    generate_data.main()
     return path
 
 
-def run(monkeypatch, capsys, *args):
-    """Run main.py with the given options and return what it printed."""
-    monkeypatch.setattr(sys, "argv", ["main.py", *args])
-    main.main()
-    return capsys.readouterr().out
+def full_rows(skip=None, flow="10.0"):
+    """One row per gauge per replay day, leaving out the (date, gauge) in `skip`."""
+    return [f"{d},{sid},{flow}" for d in main.replay_dates() for sid in IDS if (d, sid) != skip]
 
 
-# Loading
+def problems(exc):
+    """The message a load stopped with."""
+    return str(exc.value)
 
-def test_load_sensors_reads_every_sensor_and_day(data_file):
+
+# The real file
+
+def test_real_file_loads_every_gauge_and_day():
     sensors, dates = main.load_sensors()
 
-    assert len(sensors) == 8
-    assert len(dates) == config.NUM_DAYS
-    assert dates[0] == config.START_DATE
+    assert [s.id for s in sensors] == IDS
+    assert dates[0] == config.START_DATE and dates[-1] == config.END_DATE
+    assert len(dates) == 92
+    assert all(s.read(d) is not None for s in sensors for d in dates)
 
 
-def test_missing_csv_stops_with_instructions(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATA_FILE", tmp_path / "missing.csv")
-    with pytest.raises(SystemExit, match="generate_data.py"):
+def test_real_file_values_match_dwer():
+    # Spot checks read straight from DWER's export.
+    sensors = {s.id: s for s in main.load_sensors()[0]}
+    assert sensors["607022"].read("2026-06-01") == 66.35
+    assert sensors["608171"].read("2026-08-11") == 163.6
+    assert sensors["608151"].read("2026-08-31") == 171.4
+
+
+# Strict loading
+
+def test_complete_file_loads(tmp_path, monkeypatch):
+    write_csv(tmp_path, monkeypatch, full_rows())
+    sensors, dates = main.load_sensors()
+    assert sensors[0].read(dates[0]) == 10.0
+
+
+def test_missing_file_stops(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DATA_FILE", tmp_path / "nope.csv")
+    with pytest.raises(SystemExit, match="No data found"):
         main.load_sensors()
 
 
-def test_unknown_sensor_rows_are_ignored(tmp_path, monkeypatch):
-    path = tmp_path / "readings.csv"
-    path.write_text("date,sensor_id,rainfall_mm,river_level_m\n"
-                    "2026-06-01,S1,1.0,1.20\n"
-                    "2026-06-01,S99,5.0,9.99\n")
-    monkeypatch.setattr(config, "DATA_FILE", path)
+def test_wrong_header_stops(tmp_path, monkeypatch):
+    write_csv(tmp_path, monkeypatch, full_rows(), header="date,sensor_id,rainfall_mm,river_level_m")
+    with pytest.raises(SystemExit, match="must start with the header date,sensor_id,flow_ml"):
+        main.load_sensors()
 
+
+def test_missing_day_stops(tmp_path, monkeypatch):
+    write_csv(tmp_path, monkeypatch, full_rows(skip=("2026-07-16", "607013")))
+    with pytest.raises(SystemExit, match="607013 is missing 1 day"):
+        main.load_sensors()
+
+
+def test_repeated_day_stops(tmp_path, monkeypatch):
+    rows = full_rows()
+    write_csv(tmp_path, monkeypatch, rows + [rows[0]])
+    with pytest.raises(SystemExit, match="appears more than once"):
+        main.load_sensors()
+
+
+def test_unknown_gauge_stops(tmp_path, monkeypatch):
+    write_csv(tmp_path, monkeypatch, full_rows() + ["2026-06-01,610001,5.0"])
+    with pytest.raises(SystemExit, match="gauge '610001' is not one of the gauges"):
+        main.load_sensors()
+
+
+@pytest.mark.parametrize("bad_row, message", [
+    ("2026-06-01,607022,lots", "is not a number"),
+    ("2026-06-01,607022,-3", "zero or more"),
+    ("2026-06-01,607022,nan", "zero or more"),
+    ("2026-06-31,607022,5.0", "not a real date"),
+    ("2026-09-01,607022,5.0", "not a real date"),
+    ("2026-06-01,607022", "columns instead of 3"),
+])
+def test_bad_rows_are_reported_with_their_line(tmp_path, monkeypatch, bad_row, message):
+    write_csv(tmp_path, monkeypatch, full_rows(skip=("2026-06-01", "607022")) + [bad_row])
+    with pytest.raises(SystemExit) as exc:
+        main.load_sensors()
+
+    assert message in problems(exc)
+    assert "line 461" in problems(exc)
+
+
+def test_long_lists_of_problems_are_cut_short(tmp_path, monkeypatch):
+    write_csv(tmp_path, monkeypatch, full_rows(flow="oops"))
+    with pytest.raises(SystemExit) as exc:
+        main.load_sensors()
+
+    assert "has 465 problem(s)" in problems(exc)
+    assert "...and 455 more" in problems(exc)
+
+
+def test_zero_flow_is_allowed(tmp_path, monkeypatch):
+    # A stream that stops flowing reads zero, which is real data rather than an error.
+    write_csv(tmp_path, monkeypatch, full_rows(flow="0.000"))
     sensors, dates = main.load_sensors()
-    assert dates == ["2026-06-01"]
-    assert all(s.id != "S99" for s in sensors)
+    assert sensors[0].read(dates[0]) == 0.0
 
 
-# Printing a day
+# Printing
 
-def test_print_day_marks_the_flagged_sensor(data_file, capsys):
-    sensors, _ = main.load_sensors()
-    attacker = Attacker(config.ATTACKS)
-
-    alerts = main.print_day(13, "2026-06-13", sensors, attacker, Detector(), AdvisoryWriter())
+def test_print_day_shows_every_gauge_and_its_flow(capsys):
+    sensors, dates = main.load_sensors()
+    main.print_day(1, dates[0], sensors)
     out = capsys.readouterr().out
 
-    assert [a["sensor"] for a in alerts] == ["S3"]
-    assert "80.0" in out and "<-- ALERT" in out
+    assert "Day 1  |  2026-06-01" in out
+    assert all(sid in out for sid in IDS)
+    assert "Lefroy Brook - Cascades" in out and "66.35" in out
 
 
-# Scoring
-
-def test_score_counts_caught_missed_and_false_alarms(capsys):
-    attacker = Attacker([
-        {"type": "spike", "sensor": "S1", "date": "2026-06-01", "field": "rainfall_mm", "value": 50.0},
-        {"type": "spike", "sensor": "S2", "date": "2026-06-02", "field": "rainfall_mm", "value": 50.0},
-    ])
-    attacker.apply("S1", "2026-06-01", (0.0, 1.0))
-    attacker.apply("S2", "2026-06-02", (0.0, 1.0))
-
-    # One real catch, and one alert on a sensor that was never attacked.
-    alerts = [
-        {"date": "2026-06-01", "sensor": "S1", "field": "rainfall_mm"},
-        {"date": "2026-06-05", "sensor": "S4", "field": "rainfall_mm"},
-    ]
-    main.print_score(alerts, attacker)
+def test_days_option_limits_the_output(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--days", "3"])
+    main.main()
     out = capsys.readouterr().out
 
-    assert "Attacks caught:  1 of 2" in out
-    assert "Attacks missed:  1" in out
-    assert "False alarms:    1" in out
+    assert "Day 3  |  2026-06-03" in out
+    assert "Day 4" not in out
 
 
-def test_right_sensor_wrong_field_is_not_a_catch(capsys):
-    attacker = Attacker([{"type": "spike", "sensor": "S1", "date": "2026-06-01", "field": "rainfall_mm", "value": 50.0}])
-    attacker.apply("S1", "2026-06-01", (0.0, 1.0))
-
-    main.print_score([{"date": "2026-06-01", "sensor": "S1", "field": "river_level_m"}], attacker)
-    assert "Attacks caught:  0 of 1" in capsys.readouterr().out
-
-
-def test_alert_the_day_an_attack_stops_counts_as_late_not_false(capsys):
-    plan = [{"type": "drift", "sensor": "S2", "start": "2026-07-01", "days": 3, "field": "river_level_m", "rate": 0.05}]
-    attacker = Attacker(plan)
-    for d in ["2026-07-01", "2026-07-02", "2026-07-03"]:
-        attacker.apply("S2", d, (0.0, 1.0))
-
-    main.print_score([{"date": "2026-07-04", "sensor": "S2", "field": "river_level_m"}], attacker)
+def test_full_run_shows_all_92_days(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    main.main()
     out = capsys.readouterr().out
 
-    assert "Attacks caught:  0 of 1" in out
-    assert "Caught late:     1" in out
-    assert "False alarms:    0" in out
-
-
-# Full runs
-
-def test_clean_run_has_no_false_alarms(data_file, monkeypatch, capsys):
-    out = run(monkeypatch, capsys)
-    assert "False alarms:    0" in out
-    assert "ATTACK LOG" not in out
-
-
-def test_attack_run_catches_every_planned_attack(data_file, monkeypatch, capsys):
-    out = run(monkeypatch, capsys, "--attack")
-    total = len(config.ATTACKS) + len(config.ADVISORY_ATTACKS)
-
-    assert f"Attacks caught:  {total} of {total}" in out
-    assert "False alarms:    0" in out
-
-
-def test_short_run_marks_later_attacks_as_skipped(data_file, monkeypatch, capsys):
-    out = run(monkeypatch, capsys, "--attack", "--days", "20")
-
-    assert "Skipped:" in out
-    assert "WARNING" not in out
-
-
-def test_wrong_sensor_id_in_plan_gives_a_warning(data_file, monkeypatch, capsys):
-    bad_plan = [{"type": "spike", "sensor": "S99", "date": "2026-06-13", "field": "rainfall_mm", "value": 80.0}]
-    monkeypatch.setattr(config, "ATTACKS", bad_plan)
-    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "WARNING: spike on S99" in out
-
-
-def test_flatline_counts_as_one_caught_attack(data_file, monkeypatch, capsys):
-    plan = [{"type": "flatline", "sensor": "S7", "start": "2026-06-26", "days": 7, "field": "river_level_m"}]
-    monkeypatch.setattr(config, "ATTACKS", plan)
-    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "frozen at 2.68 m for 7 days" in out
-    assert "Attacks caught:  1 of 1" in out
-    assert "False alarms:    0" in out
-
-
-def test_drift_is_caught_while_it_runs(data_file, monkeypatch, capsys):
-    plan = [{"type": "drift", "sensor": "S2", "start": "2026-07-18", "days": 14, "field": "river_level_m", "rate": 0.06}]
-    monkeypatch.setattr(config, "ATTACKS", plan)
-    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "Attacks caught:  1 of 1" in out
-    assert "False alarms:    0" in out
-
-
-# Advisories in full runs
-
-def test_clean_run_publishes_twelve_advisories_with_none_flagged(data_file, monkeypatch, capsys):
-    out = run(monkeypatch, capsys)
-    advisory_lines = [line for line in out.splitlines() if "ADVISORY" in line]
-
-    assert len(advisory_lines) == 12
-    assert not any("<-- ALERT" in line for line in advisory_lines)
-
-
-def test_fake_figures_advisory_is_caught(data_file, monkeypatch, capsys):
-    monkeypatch.setattr(config, "ATTACKS", [])
-    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [
-        {"type": "fake_figures", "date": "2026-06-28", "period_start": "2026-06-22", "period_end": "2026-06-28",
-         "source": "Water Corporation", "avg_rain_mm": 6.5, "avg_level_change_m": -0.85},
-    ])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "ALERT  ADV-F1 advisory: claims 6.5 mm of rain" in out
-    assert "Attacks caught:  1 of 1" in out
-    assert "False alarms:    0" in out
-
-
-def test_fake_source_advisory_is_caught(data_file, monkeypatch, capsys):
-    monkeypatch.setattr(config, "ATTACKS", [])
-    monkeypatch.setattr(config, "ADVISORY_ATTACKS", [
-        {"type": "fake_source", "date": "2026-08-16", "period_start": "2026-08-10", "period_end": "2026-08-16",
-         "source": "WA Water Watch"},
-    ])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "ALERT  ADV-F1 advisory: source 'WA Water Watch' is not approved" in out
-    assert "Attacks caught:  1 of 1" in out
-    assert "False alarms:    0" in out
-
-
-def test_attack_log_describes_fake_advisories(data_file, monkeypatch, capsys):
-    monkeypatch.setattr(config, "ATTACKS", [])
-
-    out = run(monkeypatch, capsys, "--attack")
-    assert "ADV-F1 claimed 6.5 mm, -0.85 m when the readings showed" in out
-    assert "ADV-F2 copied the real figures under an unapproved name" in out
+    assert "Day 92  |  2026-08-31" in out
+    assert out.startswith("Streamflow from 5 DWER gauges, 2026-06-01 to 2026-08-31")

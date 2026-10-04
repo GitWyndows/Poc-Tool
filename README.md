@@ -2,8 +2,8 @@
 
 CSG3101 Applied Project, Group 3.
 
-A simulated drought monitoring system that detects tampering with sensor data
-and fake or inconsistent public advisories.
+A drought monitoring tool that replays real streamflow data and detects tampering with
+sensor readings and fake or inconsistent public advisories.
 
 ## Setup
 
@@ -15,25 +15,42 @@ and fake or inconsistent public advisories.
 
 ## Usage
 
-The tool replays 90 days of readings from 8 sensors. Each day prints as a
-table, and any sensor that looks tampered with is marked `<-- ALERT` with a
-reason underneath. A detection score is printed at the end.
+The tool replays daily streamflow from five DWER stream gauges for June to August 2026,
+printing each day as a table.
 
 ```
-python src/main.py                      # clean run, no attacks
-python src/main.py --attack             # run with the attacks planned in src/config.py
-python src/main.py --attack --days 20   # first 20 days only
-python src/main.py --attack --delay 1   # one day per second, like a live feed
-python src/main.py --attack > out.txt   # save the output to a file
+python src/main.py                      # all 92 days
+python src/main.py --days 20            # first 20 days only
+python src/main.py --delay 1            # one day per second, like a live feed
+python src/main.py > out.txt            # save the output to a file
 python src/main.py --help               # list all options
 ```
 
-With `--attack`, the run ends with the attack log (what was actually faked)
-and the score: attacks caught, caught late, missed, and false alarms.
+Tampering detection, attacks and public advisories are being rebuilt for real streamflow
+data and will return in upcoming updates.
 
-The sensor data in `data/readings.csv` is already included. To rebuild it
-(for example, after changing a setting in `src/config.py`):
+## Data
+
+`data/stream_flow.csv` holds daily streamflow in megalitres (ML/day) for 1 June to
+31 August 2026, one row per gauge per day:
 
 ```
-python src/generate_data.py
+date,sensor_id,flow_ml
+2026-06-01,607022,66.35
 ```
+
+| Gauge | Name |
+|---|---|
+| 607022 | Lefroy Brook - Cascades |
+| 607013 | Lefroy Brook - Rainbow Trail |
+| 608171 | Fly Brook - Boat Landing Road |
+| 608002 | Carey Brook - Staircase Rd |
+| 608151 | Donnelly River - Strickland |
+
+Source: Department of Water and Environmental Regulation (DWER), Water Information
+Reporting, daily total stream discharge volume, exported 4 October 2026. DWER rates all
+values in this period at +/-10% uncertainty.
+
+The tool checks the file strictly before running and stops with a list of problems if the
+header is wrong, a gauge is unknown or missing, a day is missing or repeated, or a value
+isn't a number of zero or more.

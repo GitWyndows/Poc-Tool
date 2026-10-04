@@ -2,28 +2,22 @@
 from pathlib import Path
 
 # Built from this file's location, so the CSV is found whichever folder the scripts are run from.
-DATA_FILE = Path(__file__).resolve().parents[1] / "data" / "readings.csv"
+DATA_FILE = Path(__file__).resolve().parents[1] / "data" / "stream_flow.csv"
 
-# Each (id, name) sensor measures both rainfall and river level. Names are placeholders until the team picks real stations.
+# The five DWER stream gauges in the Warren and Donnelly catchments, as (station number, name).
 SENSORS = [
-    ("S1", "Placeholder sensor 1"),
-    ("S2", "Placeholder sensor 2"),
-    ("S3", "Placeholder sensor 3"),
-    ("S4", "Placeholder sensor 4"),
-    ("S5", "Placeholder sensor 5"),
-    ("S6", "Placeholder sensor 6"),
-    ("S7", "Placeholder sensor 7"),
-    ("S8", "Placeholder sensor 8"),
+    ("607022", "Lefroy Brook - Cascades"),
+    ("607013", "Lefroy Brook - Rainbow Trail"),
+    ("608171", "Fly Brook - Boat Landing Road"),
+    ("608002", "Carey Brook - Staircase Rd"),
+    ("608151", "Donnelly River - Strickland"),
 ]
 
-# June to August covers Perth's wet season, where drought shows up as a drier-than-normal winter.
+# The replay period. The data file must cover every one of these days for every gauge.
 START_DATE = "2026-06-01"
+END_DATE = "2026-08-31"
 
-# Matches the roughly 90-day replay window in the project proposal.
-NUM_DAYS = 90
-
-# A fixed seed means everyone generates the same data, so test results can be compared.
-RANDOM_SEED = 42
+# The settings below are still set for the old rainfall and river level data until those parts are rebuilt for flow.
 
 # Planned attacks, only used with --attack. Spikes fake one day, flatlines freeze a sensor, and drift adds a little more each day.
 ATTACKS = [

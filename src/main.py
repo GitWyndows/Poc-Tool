@@ -1,213 +1,130 @@
-"""Reads the CSV and prints each day's sensor readings and weekly advisories to the terminal.
+"""Reads the DWER streamflow CSV and prints each day's flow for the five gauges.
 
-    python src/main.py                 # all 90 days
+    python src/main.py                 # all 92 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
-    python src/main.py --attack        # apply the sensor and advisory attacks planned in config.py
 
-Detection always runs, and a score is printed at the end.
-
-Run generate_data.py first if data/readings.csv doesn't exist.
+The data file is checked strictly before anything runs, so a gap or typo stops the tool instead of
+quietly skewing the results.
 """
 import argparse
 import csv
+import math
 import sys
 import time
+from datetime import date, timedelta
 
 import config
-from advisories import AdvisoryWriter, advisory_text
-from attacks import ADVISORY_TYPES, Attacker, attack_dates, day_after, describe
-from detection import Detector
 from sensor import Sensor
+
+HEADER = ["date", "sensor_id", "flow_ml"]
+
+# Enough problems to show what's wrong without burying the message.
+MAX_PROBLEMS_SHOWN = 10
+
+
+def replay_dates():
+    """Every date from START_DATE to END_DATE, as "YYYY-MM-DD" strings."""
+    start, end = date.fromisoformat(config.START_DATE), date.fromisoformat(config.END_DATE)
+    return [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+
+
+def check_row(row, known_ids, dates):
+    """Return (date, sensor_id, flow) for a valid row, or a description of what's wrong with it."""
+    if len(row) != len(HEADER):
+        return f"has {len(row)} columns instead of {len(HEADER)}"
+
+    day, sid, flow_text = row
+    if day not in dates:
+        return f"date '{day}' is not a real date between {config.START_DATE} and {config.END_DATE}"
+    if sid not in known_ids:
+        return f"gauge '{sid}' is not one of the gauges in config.py"
+
+    try:
+        flow = float(flow_text)
+    except ValueError:
+        return f"flow '{flow_text}' is not a number"
+
+    # Flow can be zero when a stream stops, but never negative, and "nan" or "inf" would poison every comparison.
+    if not math.isfinite(flow) or flow < 0:
+        return f"flow '{flow_text}' must be a number of zero or more"
+    return day, sid, flow
 
 
 def load_sensors():
-    """Create the 8 sensors and fill them with data from the CSV."""
-    # Checking first gives a clear instruction instead of a confusing file error.
+    """Read the CSV into one Sensor per gauge, stopping with every problem listed if the file isn't exactly right."""
     if not config.DATA_FILE.exists():
-        sys.exit(f"No data found at {config.DATA_FILE}\nRun: python src/generate_data.py")
+        sys.exit(f"No data found at {config.DATA_FILE}")
 
-    # Keyed by ID so each CSV row can find its sensor without searching.
     sensors = {sid: Sensor(sid, name) for sid, name in config.SENSORS}
-    dates = []
+    dates = replay_dates()
+    date_set = set(dates)
+    problems = []
 
     with open(config.DATA_FILE, newline="") as f:
-        # DictReader uses the header names, so the code doesn't break if the columns are reordered.
-        for row in csv.DictReader(f):
-            sensor = sensors.get(row["sensor_id"])
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header != HEADER:
+            sys.exit(f"{config.DATA_FILE.name} must start with the header {','.join(HEADER)}, not {header}")
 
-            # Skipping unknown IDs means a stray row can't crash the run.
-            if sensor is None:
+        # Line numbers start at 2 because the header is line 1, which makes problems easy to find in the file.
+        for line, row in enumerate(reader, start=2):
+            result = check_row(row, sensors, date_set)
+            if isinstance(result, str):
+                problems.append(f"line {line}: {result}")
                 continue
 
-            # CSV values always arrive as text, so they need converting before any maths.
-            sensor.add_reading(row["date"], float(row["rainfall_mm"]), float(row["river_level_m"]))
+            day, sid, flow = result
+            if sensors[sid].read(day) is not None:
+                problems.append(f"line {line}: {sid} on {day} appears more than once")
+                continue
+            sensors[sid].add_reading(day, flow)
 
-            # Each date appears once per sensor, so this keeps one copy in the order they appear.
-            if row["date"] not in dates:
-                dates.append(row["date"])
+    # Every gauge needs every day, since a gap would look like a sensor going quiet.
+    for s in sensors.values():
+        missing = [d for d in dates if s.read(d) is None]
+        if missing:
+            problems.append(f"{s.id} is missing {len(missing)} day(s), starting {missing[0]}")
+
+    if problems:
+        shown = "\n  ".join(problems[:MAX_PROBLEMS_SHOWN])
+        more = f"\n  ...and {len(problems) - MAX_PROBLEMS_SHOWN} more" if len(problems) > MAX_PROBLEMS_SHOWN else ""
+        sys.exit(f"{config.DATA_FILE.name} has {len(problems)} problem(s):\n  {shown}{more}")
 
     return list(sensors.values()), dates
 
 
-def print_day(day_number, date, sensors, attacker, detector, writer):
-    # Every reading passes through the attacker first, just as tampering in transit would.
-    readings = {s.id: attacker.apply(s.id, date, s.read(date)) for s in sensors}
-
-    # The detector sees only what a defender would: the readings, never the attack log.
-    alerts = detector.check_day(date, readings)
-    flagged = {a["sensor"] for a in alerts}
-
+def print_day(day_number, day, sensors):
     # Fixed column widths keep the table lined up however long each value is.
-    print(f"\nDay {day_number}  |  {date}")
-    print(f"{'Sensor':<8}{'Name':<24}{'Rainfall (mm)':>15}{'River level (m)':>18}")
-    print("-" * 65)
+    print(f"\nDay {day_number}  |  {day}")
+    print(f"{'Gauge':<8}{'Name':<32}{'Flow (ML/day)':>15}")
+    print("-" * 55)
 
     for s in sensors:
-        reading = readings[s.id]
-
-        # Plain ASCII, since some Windows terminals can't print symbols like a warning sign.
-        mark = "  <-- ALERT" if s.id in flagged else ""
-
-        # A gap is shown rather than skipped, so a silent sensor is visible in the output.
-        if reading is None:
-            print(f"{s.id:<8}{s.name:<24}{'no data':>15}{'no data':>18}{mark}")
-        else:
-            rain, level = reading
-            print(f"{s.id:<8}{s.name:<24}{rain:>15.1f}{level:>18.2f}{mark}")
-
-    # Genuine and fake advisories go out together and are checked the same way, with nothing marking which is which.
-    published = [writer.record(date, readings)] + attacker.fake_advisories(date, writer.readings_by_date)
-    for advisory in filter(None, published):
-        advisory_alerts = detector.check_advisory(advisory)
-        alerts += advisory_alerts
-        mark = "  <-- ALERT" if advisory_alerts else ""
-        print(f"  ADVISORY {advisory['id']:<7}{advisory_text(advisory)}{mark}")
-
-    # Reasons go under the table so the columns stay aligned.
-    for a in alerts:
-        print(f"  ALERT  {a['sensor']} {a['field']}: {a['reason']}")
-
-    return alerts
-
-
-def print_attack_log(attacker, all_dates, shown_dates):
-    # Printed only at the end, so the daily tables look exactly as a defender would see them.
-    print("\n" + "=" * 65)
-    print("ATTACK LOG (ground truth)")
-    print("=" * 65)
-
-    if not attacker.log:
-        print("No attacks were applied.")
-
-    # Grouped by attack, so a week-long flatline reads as one entry rather than seven.
-    for attack_id, attack in enumerate(attacker.plan):
-        entries = [e for e in attacker.log if e["attack"] == attack_id]
-        if not entries:
-            continue
-
-        first = entries[0]
-        last = entries[-1]
-        if attack["type"] == "fake_figures":
-            (fake_rain, fake_change), (real_rain, real_change) = first["fake"], first["real"]
-            detail = (f"{first['sensor']} claimed {fake_rain:.1f} mm, {fake_change:+.2f} m "
-                      f"when the readings showed {real_rain:.1f} mm, {real_change:+.2f} m")
-        elif attack["type"] == "fake_source":
-            detail = f"{first['sensor']} copied the real figures under an unapproved name"
-        else:
-            unit = "mm" if attack["field"] == "rainfall_mm" else "m"
-            if attack["type"] == "spike":
-                detail = f"real {first['real']:.2f} {unit} -> fake {first['fake']:.2f} {unit}"
-            elif attack["type"] == "drift":
-                detail = f"{last['fake'] - last['real']:+.2f} {unit} off by the last day"
-            else:
-                detail = f"frozen at {first['fake']:.2f} {unit} for {len(entries)} days"
-        print(f"{describe(attack)}: {detail}")
-
-    # A planned attack that never ran would otherwise look like one the detector missed.
-    known_ids = {sid for sid, _ in config.SENSORS}
-    for a in attacker.unused():
-        dates = attack_dates(a)
-        wrong_sensor = a["type"] not in ADVISORY_TYPES and a["sensor"] not in known_ids
-        if wrong_sensor or dates[0] not in all_dates:
-            print(f"WARNING: {describe(a)} never ran. Check the ID and dates.")
-        elif dates[0] not in shown_dates:
-            print(f"Skipped: {describe(a)} falls outside the days shown.")
-
-
-def print_score(alerts, attacker):
-    alert_keys = {(a["date"], a["sensor"], a["field"]) for a in alerts}
-    attacked_keys = {(e["date"], e["sensor"], e["field"]) for e in attacker.log}
-
-    # An alert the day an attack stops, on that sensor, is caused by the snapback rather than being false.
-    end_keys = {(day_after(attacker.plan[e["attack"]]), e["sensor"], e["field"]) for e in attacker.log}
-
-    ran = sorted({e["attack"] for e in attacker.log})
-    caught, caught_late, missed = [], [], []
-    for attack_id in ran:
-        attack = attacker.plan[attack_id]
-        entries = [e for e in attacker.log if e["attack"] == attack_id]
-        keys = {(e["date"], e["sensor"], e["field"]) for e in entries}
-        late_keys = {(day_after(attack), e["sensor"], e["field"]) for e in entries}
-
-        # Caught means an alert on the right sensor (or advisory) and field while the attack was running.
-        if keys & alert_keys:
-            caught.append(attack)
-        elif late_keys & alert_keys:
-            caught_late.append(attack)
-        else:
-            missed.append(attack)
-
-    false_alarms = alert_keys - attacked_keys - end_keys
-
-    print("\n" + "=" * 65)
-    print("DETECTION SCORE")
-    print("=" * 65)
-    print(f"Attacks caught:  {len(caught)} of {len(ran)}")
-    print(f"Caught late:     {len(caught_late)}  (only noticed when the attack stopped)")
-    print(f"Attacks missed:  {len(missed)}")
-    print(f"False alarms:    {len(false_alarms)}")
-
-    # Listing them by name shows exactly where a rule needs work.
-    for attack in caught_late:
-        print(f"  LATE         {describe(attack)}")
-    for attack in missed:
-        print(f"  MISSED       {describe(attack)}")
-    for date, sensor, field in sorted(false_alarms):
-        print(f"  FALSE ALARM  {date}  {sensor}  {field}")
+        print(f"{s.id:<8}{s.name:<32}{s.read(day):>15.2f}")
 
 
 def main():
     # argparse handles the options and builds the --help message for free.
-    parser = argparse.ArgumentParser(description="Print simulated sensor readings.")
+    parser = argparse.ArgumentParser(description="Print daily streamflow for the five DWER gauges.")
     parser.add_argument("--days", type=int, help="Only show this many days")
     parser.add_argument("--delay", type=float, default=0, help="Seconds to wait between days")
-    parser.add_argument("--attack", action="store_true", help="Apply the sensor and advisory attacks planned in config.py")
     args = parser.parse_args()
 
     sensors, dates = load_sensors()
 
-    # Attacks are opt-in so a clean run is always available to compare against.
-    attacker = Attacker(config.ATTACKS + config.ADVISORY_ATTACKS if args.attack else [])
-    detector = Detector()
-    writer = AdvisoryWriter()
-    all_alerts = []
-
     # Note that --days 0 counts as not set, so it shows every day.
     shown_dates = dates[:args.days] if args.days else dates
 
+    print(f"Streamflow from {len(sensors)} DWER gauges, {dates[0]} to {dates[-1]}")
+
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
-    for i, date in enumerate(shown_dates, start=1):
-        all_alerts += print_day(i, date, sensors, attacker, detector, writer)
+    for i, day in enumerate(shown_dates, start=1):
+        print_day(i, day, sensors)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:
             time.sleep(args.delay)
-
-    if args.attack:
-        print_attack_log(attacker, dates, shown_dates)
-
-    print_score(all_alerts, attacker)
 
 
 # Runs only when the file is executed directly rather than imported.
