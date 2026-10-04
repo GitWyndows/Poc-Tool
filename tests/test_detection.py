@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import pytest
 
 import config
+from advisories import AdvisoryWriter, make_advisory
 from detection import Detector, percent
 
 GAUGES = ["A", "B", "C", "D", "E"]
@@ -205,3 +206,88 @@ def test_very_slow_drift_gets_through(detector):
 @pytest.mark.parametrize("log_change, text", [(0.0, "+0%"), (math.log(2), "+100%"), (math.log(0.5), "-50%")])
 def test_percent_turns_logs_into_plain_changes(log_change, text):
     assert percent(log_change) == text
+
+
+# Advisories
+
+def seen_week(detector):
+    """Feed the detector a week of July flows, rising 1 ML/day per gauge, as if checks were running."""
+    for i in range(7):
+        detector.readings_by_date[f"2026-07-{i + 1:02d}"] = {sid: 20.0 + i for sid in GAUGES}
+
+
+def advisory(source="Water Corporation", flow=115.0, change=0.30, start="2026-07-01", end="2026-07-07"):
+    """An advisory for 1-7 July whose figures match seen_week, unless told otherwise."""
+    return make_advisory("ADV-01", end, start, end, source, flow, change)
+
+
+def test_genuine_advisory_raises_nothing():
+    detector = Detector()
+    seen_week(detector)
+    assert detector.check_advisory(advisory()) == []
+
+
+def test_every_advisory_the_writer_publishes_passes():
+    # The writer and the checker must agree, or every genuine notice would be a false alarm.
+    detector, writer = Detector(), AdvisoryWriter()
+    run(detector, learning_days(), start="2026-06-01")
+    for d, flows in detector.readings_by_date.items():
+        published = writer.record(d, flows)
+        if published:
+            assert detector.check_advisory(published) == []
+
+
+def test_unapproved_source_is_flagged_even_with_real_figures():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(source="WA Water Watch"))
+
+    assert alert["rule"] == "advisory" and alert["sensor"] == "ADV-01"
+    assert alert["reason"] == "source 'WA Water Watch' is not approved"
+
+
+def test_wrong_flow_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(flow=60.0))
+    assert alert["reason"] == "claims 60.0 ML/day vs 115.0 ML/day in the readings"
+
+
+def test_wrong_change_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(change=-0.40))
+    assert alert["reason"] == "claims a -40% change vs +30% in the readings"
+
+
+def test_several_problems_give_one_alert():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(source="WA Water Watch", flow=60.0, change=-0.40))
+    assert alert["reason"].count(";") == 2
+
+
+def test_rounding_is_allowed_for():
+    # A notice quotes 1 decimal place and whole percentages, which mustn't count as a lie.
+    detector = Detector()
+    seen_week(detector)
+    assert detector.check_advisory(advisory(flow=115.04, change=0.304)) == []
+
+
+def test_advisory_for_a_period_with_no_readings_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(start="2026-08-01", end="2026-08-07"))
+    assert alert["reason"] == "no readings exist for the period it describes"
+
+
+def test_advisory_built_from_tampered_readings_passes():
+    # A known limitation: if the gauges were tampered with, an honest notice repeats the lie and still matches.
+    detector = Detector()
+    seen_week(detector)
+    detector.readings_by_date["2026-07-04"]["C"] = 500.0
+    tampered = AdvisoryWriter()
+    published = [tampered.record(d, flows) for d, flows in sorted(detector.readings_by_date.items())][-1]
+
+    assert published is not None
+    assert detector.check_advisory(published) == []

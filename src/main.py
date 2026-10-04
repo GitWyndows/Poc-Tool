@@ -1,9 +1,9 @@
-"""Replays the DWER streamflow CSV day by day, printing each gauge's flow and any alerts from the detector.
+"""Replays the DWER streamflow CSV day by day, printing each gauge's flow, the weekly advisories, and any alerts.
 
     python src/main.py                 # all 92 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
-    python src/main.py --attack        # apply the attacks planned in config.py, then score the detector
+    python src/main.py --attack        # apply the sensor and advisory attacks in config.py, then score the detector
 
 The data file is checked strictly before anything runs, so a gap or typo stops the tool instead of
 quietly skewing the results. June is spent learning how the gauges normally behave, and checks start in July.
@@ -16,6 +16,7 @@ import time
 from datetime import date, timedelta
 
 import config
+from advisories import AdvisoryWriter, advisory_text
 from attacks import Attacker, describe, score
 from detection import Detector
 from sensor import Sensor
@@ -97,7 +98,7 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
-def print_day(day_number, day, sensors, flows, alerts):
+def print_day(day_number, day, sensors, flows, advisories, alerts):
     # Fixed column widths keep the table lined up however long each value is.
     learning = "  |  learning" if day <= config.LEARN_END else ""
     print(f"\nDay {day_number}  |  {day}{learning}")
@@ -110,6 +111,12 @@ def print_day(day_number, day, sensors, flows, alerts):
         mark = "  <-- ALERT" if s.id in flagged else ""
         print(f"{s.id:<8}{s.name:<32}{flows[s.id]:>15.2f}{mark}")
 
+    # Genuine and fake advisories are printed the same way, with nothing marking which is which.
+    for advisory in advisories:
+        mark = "  <-- ALERT" if advisory["id"] in flagged else ""
+        print(f"  ADVISORY {advisory['id']:<7}{advisory_text(advisory)}{mark}")
+
+    # Reasons go under the table so the columns stay aligned.
     for a in alerts:
         print(f"  ALERT {a['sensor']} {a['rule']}: {a['reason']}")
 
@@ -143,7 +150,13 @@ def print_attack_log(attacker):
             continue
 
         first, last = entries[0], entries[-1]
-        if attack["type"] == "spike":
+        if attack["type"] == "fake_figures":
+            (fake_flow, fake_change), (real_flow, real_change) = first["fake"], first["real"]
+            detail = (f"{first['sensor']} claimed {fake_flow:.1f} ML/day, {fake_change:+d}% "
+                      f"when the readings showed {real_flow:.1f} ML/day, {real_change:+d}%")
+        elif attack["type"] == "fake_source":
+            detail = f"{first['sensor']} copied the real figures under an unapproved name"
+        elif attack["type"] == "spike":
             detail = f"real {first['real']:.2f} -> fake {first['fake']:.2f} ML/day"
         elif attack["type"] == "drift":
             detail = f"{last['fake'] / last['real'] - 1:+.0%} off by the last day"
@@ -186,6 +199,7 @@ def main():
     # Attacks are opt-in so a clean run is always available to compare against.
     attacker = Attacker(config.ATTACKS if args.attack else [])
     detector = Detector()
+    writer = AdvisoryWriter()
     all_alerts = []
 
     # Note that --days 0 counts as not set, so it shows every day.
@@ -198,8 +212,15 @@ def main():
         # Every reading passes through the attacker first, and the detector sees only what comes out, never the log.
         flows = {s.id: attacker.apply(s.id, day, s.read(day)) for s in sensors}
         alerts = detector.check_day(day, flows)
+
+        # Genuine and fake advisories go out together and are checked the same way.
+        advisories = [writer.record(day, flows)] + attacker.fake_advisories(day, writer.readings_by_date)
+        advisories = [a for a in advisories if a is not None]
+        for advisory in advisories:
+            alerts += detector.check_advisory(advisory)
+
         all_alerts += alerts
-        print_day(i, day, sensors, flows, alerts)
+        print_day(i, day, sensors, flows, advisories, alerts)
 
         # The pause makes the replay look like a live feed during a demo.
         if args.delay:

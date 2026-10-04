@@ -1,10 +1,10 @@
-"""Public advisories: the weekly notices an agency publishes from its sensor readings."""
+"""Public advisories: the weekly streamflow notices an agency publishes from its gauge readings."""
 from datetime import date
 
 import config
 
 
-def make_advisory(advisory_id, published, period_start, period_end, source, avg_rain_mm, avg_level_change_m):
+def make_advisory(advisory_id, published, period_start, period_end, source, avg_flow_ml, change):
     """Build one advisory as a dict, the same shape whether it's genuine or fake."""
     # Checked here so a broken advisory fails where it's made, not later when it's read.
     if date.fromisoformat(period_end) < date.fromisoformat(period_start):
@@ -17,8 +17,8 @@ def make_advisory(advisory_id, published, period_start, period_end, source, avg_
         "period_end": period_end,
         "source": source,
         # Rounded to what a public notice would quote, which the checker will need to allow for.
-        "avg_rain_mm": round(avg_rain_mm, 1),
-        "avg_level_change_m": round(avg_level_change_m, 2),
+        "avg_flow_ml": round(avg_flow_ml, 1),
+        "change_pct": round(change * 100),
     }
 
 
@@ -32,35 +32,30 @@ def format_period(start, end):
 
 def advisory_text(advisory):
     """The sentence the public would read, built only from the advisory's own fields."""
-    change = advisory["avg_level_change_m"]
-    direction = "up" if change > 0 else "down" if change < 0 else "unchanged"
-    amount = f" {abs(change):.2f} m" if change else ""
+    change = advisory["change_pct"]
+    direction = f"up {change}%" if change > 0 else f"down {-change}%" if change < 0 else "unchanged"
 
     return (f"{advisory['source']} weekly update "
             f"({format_period(advisory['period_start'], advisory['period_end'])}): "
-            f"average rainfall {advisory['avg_rain_mm']:.1f} mm, river levels {direction}{amount}.")
+            f"combined streamflow averaged {advisory['avg_flow_ml']:.1f} ML/day, {direction} over the week.")
 
 
 def weekly_figures(readings_by_date, start, end):
-    """Return (average weekly rainfall, average river-level change) across the sensors, or None if there's no data."""
+    """Return (average combined flow in ML/day, change from the first day to the last), or None without both ends."""
+    # The change needs both ends of the period, so a period the readings don't cover has no figures.
+    if start not in readings_by_date or end not in readings_by_date:
+        return None
+
     # ISO date strings sort in date order, so a plain comparison picks out the period.
     days = [d for d in sorted(readings_by_date) if start <= d <= end]
 
-    # Each sensor's rainfall for the week is added up first, then those totals are averaged across the sensors.
-    totals = {}
-    for d in days:
-        for sid, reading in readings_by_date[d].items():
-            if reading is not None:
-                totals[sid] = totals.get(sid, 0.0) + reading[0]
+    # Combined flow adds up every gauge, which is how much water the catchments delivered that day.
+    combined = [sum(readings_by_date[d].values()) for d in days]
+    first, last = combined[0], combined[-1]
 
-    # The change is measured from the first day of the period to the last, for sensors that reported on both.
-    first = readings_by_date.get(start, {})
-    last = readings_by_date.get(end, {})
-    changes = [last[sid][1] - first[sid][1] for sid in first if first.get(sid) and last.get(sid)]
-
-    if not totals or not changes:
-        return None
-    return sum(totals.values()) / len(totals), sum(changes) / len(changes)
+    # A period that starts with every stream dry has no sensible percentage change, so it's reported as none.
+    change = last / first - 1 if first else 0.0
+    return sum(combined) / len(combined), change
 
 
 class AdvisoryWriter:
@@ -76,10 +71,10 @@ class AdvisoryWriter:
         self.period = []
         self.count = 0
 
-    def record(self, date, readings):
-        """Store one day's readings, and return an advisory if one is due today, otherwise None."""
+    def record(self, date, flows):
+        """Store one day's flows, and return an advisory if one is due today, otherwise None."""
         # The agency only has what its own system reports, so tampered readings end up in its advisories too.
-        self.readings_by_date[date] = dict(readings)
+        self.readings_by_date[date] = dict(flows)
         self.period.append(date)
 
         if len(self.period) < config.ADVISORY_EVERY_DAYS:

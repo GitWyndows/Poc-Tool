@@ -1,6 +1,7 @@
-"""Tests for attacks.py: the right flow is changed, every change is logged, and scoring marks alerts fairly."""
+"""Tests for attacks.py: the right flow is changed, fake advisories go out, everything is logged, and scoring is fair."""
 import pytest
 
+import config
 from attacks import Attacker, attack_dates, day_after, describe, score
 
 SPIKE = {"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.0}
@@ -8,6 +9,16 @@ SPIKE = {"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.
 FLATLINE = {"type": "flatline", "sensor": "608002", "start": "2026-07-22", "days": 3}
 
 DRIFT = {"type": "drift", "sensor": "607022", "start": "2026-08-08", "days": 3, "rate": 0.10}
+
+FAKE_FIGURES = {"type": "fake_figures", "date": "2026-07-07", "source": "Water Corporation",
+                "avg_flow_ml": 40.0, "change_pct": -65}
+
+FAKE_SOURCE = {"type": "fake_source", "date": "2026-07-07", "source": "WA Water Watch"}
+
+
+def week_of_readings():
+    """Seven July days where five gauges carry 20 to 26 ML/day, so combined flow averages 115 and rises 30%."""
+    return {f"2026-07-{i + 1:02d}": {f"G{g}": 20.0 + i for g in range(5)} for i in range(7)}
 
 
 def alert(day, sensor):
@@ -52,6 +63,9 @@ def test_empty_plan_changes_nothing():
     ({**SPIKE, "sensor": "S3"}, "'S3' is not one of the gauges"),
     ({**SPIKE, "date": "2026-06-20"}, "after the learning period"),
     ({**FLATLINE, "start": "2026-08-30"}, "after the learning period"),
+    ({**FAKE_FIGURES, "date": "2026-06-28"}, "after the learning period"),
+    ({k: v for k, v in FAKE_FIGURES.items() if k != "change_pct"}, "missing 'change_pct'"),
+    ({**FAKE_SOURCE, "source": config.APPROVED_SOURCES[0]}, "is an approved source"),
 ])
 def test_bad_plans_fail_straight_away(bad, message):
     with pytest.raises(ValueError, match=message):
@@ -108,6 +122,48 @@ def test_describe_gives_a_readable_summary():
     assert describe(DRIFT) == "drift on 607022 of +10% a day from 2026-08-08 to 2026-08-10"
 
 
+# Fake advisories
+
+def test_fake_figures_quotes_made_up_numbers_under_an_approved_name():
+    [fake] = Attacker([FAKE_FIGURES]).fake_advisories("2026-07-07", week_of_readings())
+
+    assert fake["source"] == "Water Corporation"
+    assert (fake["avg_flow_ml"], fake["change_pct"]) == (40.0, -65)
+    assert (fake["period_start"], fake["period_end"]) == ("2026-07-01", "2026-07-07")
+
+
+def test_fake_figures_log_shows_the_real_figures_too():
+    attacker = Attacker([FAKE_FIGURES])
+    attacker.fake_advisories("2026-07-07", week_of_readings())
+
+    entry = attacker.log[0]
+    assert entry["sensor"] == "ADV-F1"
+    assert (entry["real"], entry["fake"]) == ((115.0, 30), (40.0, -65))
+
+
+def test_fake_source_copies_the_real_figures():
+    [fake] = Attacker([FAKE_SOURCE]).fake_advisories("2026-07-07", week_of_readings())
+
+    assert fake["source"] == "WA Water Watch"
+    assert (fake["avg_flow_ml"], fake["change_pct"]) == (115.0, 30)
+
+
+def test_fake_advisories_only_go_out_on_their_date():
+    attacker = Attacker([FAKE_FIGURES])
+    assert attacker.fake_advisories("2026-07-06", week_of_readings()) == []
+    assert attacker.log == []
+
+
+def test_advisory_attacks_leave_readings_alone():
+    attacker = Attacker([FAKE_FIGURES, FAKE_SOURCE])
+    assert attacker.apply("608171", "2026-07-07", 33.32) == 33.32
+
+
+def test_describe_fake_advisories():
+    assert describe(FAKE_FIGURES) == "fake figures posing as Water Corporation on 2026-07-07"
+    assert describe(FAKE_SOURCE) == "fake advisory from 'WA Water Watch' on 2026-07-07"
+
+
 # Scoring
 
 def attacked(*plan):
@@ -144,3 +200,17 @@ def test_one_alert_catches_a_long_attack_once():
     alerts = [alert(d, "608002") for d in attack_dates(FLATLINE)]
     caught, _, _, false = score(alerts, attacked(FLATLINE, SPIKE))
     assert (caught, false) == ([FLATLINE], [])
+
+
+def test_flagged_fake_advisory_counts_as_caught():
+    attacker = Attacker([FAKE_SOURCE])
+    attacker.fake_advisories("2026-07-07", week_of_readings())
+    caught, _, _, false = score([alert("2026-07-07", "ADV-F1")], attacker)
+    assert (caught, false) == ([FAKE_SOURCE], [])
+
+
+def test_unflagged_fake_advisory_is_missed():
+    attacker = Attacker([FAKE_SOURCE])
+    attacker.fake_advisories("2026-07-07", week_of_readings())
+    _, _, missed, _ = score([], attacker)
+    assert missed == [FAKE_SOURCE]

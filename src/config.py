@@ -35,8 +35,19 @@ DRIFT_DAYS = 10
 # That total is flagged when it's 1.5 times the biggest total seen while learning.
 DRIFT_MARGIN = 1.5
 
+# Advisories from any other source are treated as untrustworthy, however believable their figures.
+APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]
+
+# A genuine advisory is published every this many days, covering the days since the last one.
+ADVISORY_EVERY_DAYS = 7
+
+# An advisory's figures may differ from the readings by this much, which covers rounding with room to spare.
+ADVISORY_FLOW_TOLERANCE_ML = 0.1
+ADVISORY_CHANGE_TOLERANCE_PCT = 1
+
 # Planned attacks, only used with --attack, all after learning so June stays clean. A spike multiplies one day's flow,
-# a flatline freezes a gauge, and drift adds the same percentage on top of the last each day.
+# a flatline freezes a gauge, and drift adds the same percentage on top of the last each day. Fake figures pose as an
+# approved source with made-up numbers, while a fake source quotes the real numbers under a name that isn't approved.
 ATTACKS = [
     {"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.0},
     {"type": "spike", "sensor": "607013", "date": "2026-08-05", "factor": 0.5},
@@ -44,21 +55,6 @@ ATTACKS = [
     {"type": "flatline", "sensor": "608002", "start": "2026-07-22", "days": 7},
     {"type": "drift", "sensor": "607022", "start": "2026-08-08", "days": 14, "rate": 0.10},
     {"type": "drift", "sensor": "608151", "start": "2026-07-27", "days": 14, "rate": 0.05},
-]
-
-# The settings below are still set for the old rainfall and river-level advisories, until those are rebuilt for flow.
-
-# Advisories from any other source are treated as untrustworthy, however believable their figures.
-APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]
-
-# A genuine advisory is published every this many days, covering the days since the last one.
-ADVISORY_EVERY_DAYS = 7
-
-# Planned fake advisories, only used with --attack. Fake figures pose as an approved source with made-up numbers,
-# while a fake source quotes the real numbers under a name that isn't approved.
-ADVISORY_ATTACKS = [
-    {"type": "fake_figures", "date": "2026-06-28", "period_start": "2026-06-22", "period_end": "2026-06-28",
-     "source": "Water Corporation", "avg_rain_mm": 6.5, "avg_level_change_m": -0.85},
-    {"type": "fake_source", "date": "2026-08-16", "period_start": "2026-08-10", "period_end": "2026-08-16",
-     "source": "WA Water Watch"},
+    {"type": "fake_figures", "date": "2026-07-19", "source": "Water Corporation", "avg_flow_ml": 140.0, "change_pct": -65},
+    {"type": "fake_source", "date": "2026-08-16", "source": "WA Water Watch"},
 ]

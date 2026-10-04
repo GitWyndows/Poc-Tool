@@ -1,8 +1,10 @@
-"""Detection rules for streamflow: sudden jumps, stuck gauges and slow drift, each judged against the other gauges."""
+"""Detection rules for streamflow (sudden jumps, stuck gauges and slow drift, each judged against the other gauges)
+and for public advisories (unapproved sources and figures that don't match the readings)."""
 import math
 from statistics import median
 
 import config
+from advisories import weekly_figures
 
 
 def to_log(flow):
@@ -42,8 +44,12 @@ class Detector:
         self.jump_limit = {}
         self.drift_limit = {}
 
+        # Every day's flows as seen, so an advisory's figures can be checked against them.
+        self.readings_by_date = {}
+
     def check_day(self, date, flows):
         """Return a list of alerts for one day, given {gauge_id: flow in ML/day}."""
+        self.readings_by_date[date] = dict(flows)
         learning = date <= config.LEARN_END
         if not learning and not self.jump_limit:
             self._set_limits(flows)
@@ -195,6 +201,31 @@ class Detector:
         # Only the last few days are kept, so old differences can't build up forever.
         self.gaps.setdefault(sid, []).append(gap)
         del self.gaps[sid][:-config.DRIFT_DAYS]
+
+    def check_advisory(self, advisory):
+        """Return a list with one alert if an advisory's source or figures don't hold up, otherwise an empty list."""
+        problems = []
+
+        # Believable figures don't make up for an unknown source, since copying real numbers is how an impersonator works.
+        if advisory["source"] not in config.APPROVED_SOURCES:
+            problems.append(f"source '{advisory['source']}' is not approved")
+
+        # The figures are rebuilt from the flows the detector has seen, using the same maths as the writer.
+        figures = weekly_figures(self.readings_by_date, advisory["period_start"], advisory["period_end"])
+        if figures is None:
+            problems.append("no readings exist for the period it describes")
+        else:
+            flow, change = figures
+            if abs(advisory["avg_flow_ml"] - flow) > config.ADVISORY_FLOW_TOLERANCE_ML:
+                problems.append(f"claims {advisory['avg_flow_ml']:.1f} ML/day vs {flow:.1f} ML/day in the readings")
+            if abs(advisory["change_pct"] - change * 100) > config.ADVISORY_CHANGE_TOLERANCE_PCT:
+                problems.append(f"claims a {advisory['change_pct']:+d}% change vs {change:+.0%} in the readings")
+
+        if not problems:
+            return []
+
+        # One alert per advisory, with every problem listed, so a notice that fails both checks isn't counted twice.
+        return [self._alert(advisory["published"], advisory["id"], "advisory", advisory["source"], "; ".join(problems))]
 
     @staticmethod
     def _alert(date, sensor_id, rule, value, reason):

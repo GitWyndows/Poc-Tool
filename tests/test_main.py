@@ -1,10 +1,11 @@
-"""Tests for main.py: strict loading of the streamflow CSV, printing it, checking it, and scoring attacks."""
+"""Tests for main.py: strict loading of the streamflow CSV, printing it with advisories, checking it, and scoring."""
 import sys
 
 import pytest
 
 import config
 import main
+from advisories import make_advisory
 
 IDS = [sid for sid, _ in config.SENSORS]
 
@@ -127,7 +128,7 @@ def flows_on(sensors, day):
 
 def test_print_day_shows_every_gauge_and_its_flow(capsys):
     sensors, dates = main.load_sensors()
-    main.print_day(1, dates[0], sensors, flows_on(sensors, dates[0]), [])
+    main.print_day(1, dates[0], sensors, flows_on(sensors, dates[0]), [], [])
     out = capsys.readouterr().out
 
     assert "Day 1  |  2026-06-01  |  learning" in out
@@ -139,12 +140,27 @@ def test_print_day_shows_the_flows_as_seen_and_marks_alerts(capsys):
     sensors, _ = main.load_sensors()
     flows = {**flows_on(sensors, "2026-07-15"), "608171": 99.96}
     alert = {"date": "2026-07-15", "sensor": "608171", "rule": "jump", "value": 99.96, "reason": "changed +152%"}
-    main.print_day(45, "2026-07-15", sensors, flows, [alert])
+    main.print_day(45, "2026-07-15", sensors, flows, [], [alert])
     out = capsys.readouterr().out
 
     assert "Day 45  |  2026-07-15\n" in out
     assert "99.96  <-- ALERT" in out
     assert "ALERT 608171 jump: changed +152%" in out
+
+
+def test_print_day_shows_advisories_and_marks_flagged_ones(capsys):
+    sensors, _ = main.load_sensors()
+    genuine = make_advisory("ADV-07", "2026-07-19", "2026-07-13", "2026-07-19", "Water Corporation", 370.7, -0.24)
+    fake = make_advisory("ADV-F1", "2026-07-19", "2026-07-13", "2026-07-19", "WA Water Watch", 370.7, -0.24)
+    alert = {"date": "2026-07-19", "sensor": "ADV-F1", "rule": "advisory", "value": "WA Water Watch",
+             "reason": "source 'WA Water Watch' is not approved"}
+    main.print_day(49, "2026-07-19", sensors, flows_on(sensors, "2026-07-19"), [genuine, fake], [alert])
+    out = capsys.readouterr().out
+
+    assert "ADVISORY ADV-07 Water Corporation weekly update (13-19 Jul)" in out
+    assert "down 24% over the week.\n" in out
+    assert "WA Water Watch weekly update (13-19 Jul)" in out and "over the week.  <-- ALERT" in out
+    assert "ALERT ADV-F1 advisory: source 'WA Water Watch' is not approved" in out
 
 
 def test_days_option_limits_the_output(monkeypatch, capsys):
@@ -164,6 +180,10 @@ def test_full_run_shows_all_92_days(monkeypatch, capsys):
 
     assert "Day 92  |  2026-08-31" in out
     assert out.startswith("Streamflow from 5 DWER gauges, 2026-06-01 to 2026-08-31")
+
+    # A genuine advisory every 7 days, from 1-7 June to 24-30 August.
+    assert out.count("ADVISORY ADV-") == 13
+    assert "ADV-13 Water Corporation weekly update (24-30 Aug)" in out
 
 
 def test_clean_real_data_raises_no_alerts(monkeypatch, capsys):
@@ -187,7 +207,9 @@ def test_attack_run_logs_and_scores_the_planned_attacks(monkeypatch, capsys):
 
     # The planned attacks are chosen to show both what the detector catches and where it falls short.
     assert "spike on 608171 of x3.0 on 2026-07-15: real 33.32 -> fake 99.96 ML/day" in out
-    assert "Attacks caught:  4 of 6" in out
+    assert "ADV-F1 claimed 140.0 ML/day, -65% when the readings showed 380.2 ML/day, -24%" in out
+    assert "ADV-F2 copied the real figures under an unapproved name" in out
+    assert "Attacks caught:  6 of 8" in out
     assert "LATE         drift on 608151" in out
     assert "MISSED       spike on 608002 of x1.5" in out
     assert "False alarms:    0" in out
@@ -198,8 +220,9 @@ def test_attacks_after_the_days_shown_are_reported_as_skipped(monkeypatch, capsy
     main.main()
     out = capsys.readouterr().out
 
+    # 50 days reaches 20 July, so only the 15 July spike and the 19 July fake advisory have run.
     assert "Skipped: spike on 607013 of x0.5 on 2026-08-05 falls outside the days shown." in out
-    assert "Attacks caught:  1 of 1" in out
+    assert "Attacks caught:  2 of 2" in out
 
 
 def test_bad_attack_plan_stops_before_anything_runs(monkeypatch):

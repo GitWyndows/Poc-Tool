@@ -17,21 +17,21 @@ sensor readings and fake or inconsistent public advisories.
 
 The tool replays daily streamflow from five DWER stream gauges for June to August 2026,
 printing each day as a table. June is spent learning how much the gauges normally disagree,
-and from 1 July any gauge that strays further than that is flagged with an alert.
+and from 1 July any gauge that strays further than that is flagged with an alert. Every 7 days
+a public advisory reports the week's combined flow, and each advisory is checked for an
+approved source and for figures that match the readings.
 
 ```
 python src/main.py                      # all 92 days
 python src/main.py --days 20            # first 20 days only
 python src/main.py --delay 1            # one day per second, like a live feed
-python src/main.py --attack             # tamper with readings as planned in config.py, then score the detector
+python src/main.py --attack             # tamper with readings and advisories as planned in config.py, then score the detector
 python src/main.py > out.txt            # save the output to a file
 python src/main.py --help               # list all options
 ```
 
 With `--attack`, the run ends with the attack log (what was really changed) and a score:
 attacks caught, caught late, missed, and false alarms.
-
-Public advisories are being rebuilt for real streamflow data and will return in an upcoming update.
 
 ## Data
 
