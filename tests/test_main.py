@@ -173,6 +173,27 @@ def test_days_option_limits_the_output(monkeypatch, capsys):
     assert "Still learning, so nothing was checked" in out
 
 
+@pytest.mark.parametrize("option, message", [
+    (["--days", "0"], "--days must be 1 or more"),
+    (["--days", "-3"], "--days must be 1 or more"),
+    (["--delay", "-1"], "--delay can't be negative"),
+])
+def test_bad_options_stop_with_a_clear_message(monkeypatch, capsys, option, message):
+    monkeypatch.setattr(sys, "argv", ["main.py", *option])
+    with pytest.raises(SystemExit):
+        main.main()
+    assert message in capsys.readouterr().err
+
+
+def test_days_beyond_the_data_shows_every_day(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--days", "200"])
+    main.main()
+    out = capsys.readouterr().out
+
+    assert "Day 92  |  2026-08-31" in out
+    assert "Day 93" not in out
+
+
 def test_full_run_shows_all_92_days(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["main.py"])
     main.main()

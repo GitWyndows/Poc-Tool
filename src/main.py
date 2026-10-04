@@ -194,6 +194,12 @@ def main():
     parser.add_argument("--attack", action="store_true", help="Apply the attacks planned in config.py")
     args = parser.parse_args()
 
+    # Caught here with a clear message, since 0 days would quietly show nothing and a negative pause would crash.
+    if args.days is not None and args.days < 1:
+        parser.error("--days must be 1 or more")
+    if args.delay < 0:
+        parser.error("--delay can't be negative")
+
     sensors, dates = load_sensors()
 
     # Attacks are opt-in so a clean run is always available to compare against.
@@ -202,8 +208,7 @@ def main():
     writer = AdvisoryWriter()
     all_alerts = []
 
-    # Note that --days 0 counts as not set, so it shows every day.
-    shown_dates = dates[:args.days] if args.days else dates
+    shown_dates = dates if args.days is None else dates[:args.days]
 
     print(f"Streamflow from {len(sensors)} DWER gauges, {dates[0]} to {dates[-1]}")
 
