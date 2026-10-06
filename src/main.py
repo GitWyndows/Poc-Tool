@@ -98,6 +98,21 @@ def load_sensors():
     return list(sensors.values()), dates
 
 
+def run_day(day, sensors, attacker, detector, writer):
+    """Pass one day through the attacker, detector and advisory writer, returning (flows, advisories, alerts)."""
+    # Every reading passes through the attacker first, and the detector sees only what comes out, never the log.
+    flows = {s.id: attacker.apply(s.id, day, s.read(day)) for s in sensors}
+    alerts = detector.check_day(day, flows)
+
+    # Genuine and fake advisories go out together and are checked the same way.
+    advisories = [writer.record(day, flows)] + attacker.fake_advisories(day, writer.readings_by_date)
+    advisories = [a for a in advisories if a is not None]
+    for advisory in advisories:
+        alerts += detector.check_advisory(advisory)
+
+    return flows, advisories, alerts
+
+
 def print_day(day_number, day, sensors, flows, advisories, alerts):
     # Fixed column widths keep the table lined up however long each value is.
     learning = "  |  learning" if day <= config.LEARN_END else ""
@@ -214,16 +229,7 @@ def main():
 
     # Counting from 1 so the output reads "Day 1" rather than "Day 0".
     for i, day in enumerate(shown_dates, start=1):
-        # Every reading passes through the attacker first, and the detector sees only what comes out, never the log.
-        flows = {s.id: attacker.apply(s.id, day, s.read(day)) for s in sensors}
-        alerts = detector.check_day(day, flows)
-
-        # Genuine and fake advisories go out together and are checked the same way.
-        advisories = [writer.record(day, flows)] + attacker.fake_advisories(day, writer.readings_by_date)
-        advisories = [a for a in advisories if a is not None]
-        for advisory in advisories:
-            alerts += detector.check_advisory(advisory)
-
+        flows, advisories, alerts = run_day(day, sensors, attacker, detector, writer)
         all_alerts += alerts
         print_day(i, day, sensors, flows, advisories, alerts)
 

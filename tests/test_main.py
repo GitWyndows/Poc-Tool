@@ -119,6 +119,33 @@ def test_zero_flow_is_allowed(tmp_path, monkeypatch):
     assert sensors[0].read(dates[0]) == 0.0
 
 
+# Running a day
+
+def test_run_day_passes_readings_through_the_attacker_to_the_detector():
+    sensors, dates = main.load_sensors()
+    attacker = main.Attacker([{"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.0}])
+    detector, writer = main.Detector(), main.AdvisoryWriter()
+    for day in dates[:dates.index("2026-07-15")]:
+        main.run_day(day, sensors, attacker, detector, writer)
+
+    flows, advisories, alerts = main.run_day("2026-07-15", sensors, attacker, detector, writer)
+
+    # The detector and the advisory writer both get the tampered flow, never the real one.
+    assert flows["608171"] == 99.96
+    assert writer.readings_by_date["2026-07-15"]["608171"] == 99.96
+    assert [(a["sensor"], a["rule"]) for a in alerts] == [("608171", "jump")]
+    assert advisories == []
+
+
+def test_run_day_returns_the_advisory_due_that_day():
+    sensors, dates = main.load_sensors()
+    attacker, detector, writer = main.Attacker([]), main.Detector(), main.AdvisoryWriter()
+    results = [main.run_day(day, sensors, attacker, detector, writer) for day in dates[:7]]
+
+    assert [len(advisories) for _, advisories, _ in results] == [0, 0, 0, 0, 0, 0, 1]
+    assert results[6][1][0]["id"] == "ADV-01"
+
+
 # Printing
 
 def flows_on(sensors, day):
