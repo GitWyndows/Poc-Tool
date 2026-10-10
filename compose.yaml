@@ -1,0 +1,8 @@
+# Lets the whole tool run with Docker Compose: `docker compose up` starts the dashboard, and
+# `docker compose run --rm poc python src/main.py --attack` runs any other command in the same container.
+services:
+  poc:
+    build: .
+    image: poc-tool
+    ports:
+      - "5000:5000"
