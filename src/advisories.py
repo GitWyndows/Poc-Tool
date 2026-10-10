@@ -71,6 +71,9 @@ class AdvisoryWriter:
         self.period = []
         self.count = 0
 
+        # Every advisory this writer has put out, so the run can check afterwards which ones quoted tampered readings.
+        self.published = []
+
     def record(self, date, flows):
         """Store one day's flows, and return an advisory if one is due today, otherwise None."""
         # The agency only has what its own system reports, so tampered readings end up in its advisories too.
@@ -89,4 +92,6 @@ class AdvisoryWriter:
 
         # Published on the last day of the period, so the notice appears as soon as the week is complete.
         self.count += 1
-        return make_advisory(f"ADV-{self.count:02d}", end, start, end, self.source, *figures)
+        advisory = make_advisory(f"ADV-{self.count:02d}", end, start, end, self.source, *figures)
+        self.published.append(advisory)
+        return advisory

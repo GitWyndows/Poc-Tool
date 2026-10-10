@@ -3,7 +3,8 @@
     python src/main.py                 # all 92 days
     python src/main.py --days 5        # first 5 days only
     python src/main.py --delay 1       # wait 1 second between days (looks "live")
-    python src/main.py --attack        # apply the sensor and advisory attacks in config.py, then score the detector
+    python src/main.py --attack        # apply the mixed attacks planned in config.py, then score the detector
+    python src/main.py --attack coordinated   # drift two gauges together so genuine advisories quote the lie
 
 The data file is checked strictly before anything runs, so a gap or typo stops the tool instead of
 quietly skewing the results. June is spent learning how the gauges normally behave, and checks start in July.
@@ -17,7 +18,7 @@ from datetime import date, timedelta
 
 import config
 from advisories import AdvisoryWriter, advisory_text
-from attacks import Attacker, describe, score
+from attacks import Attacker, advisory_period, describe, score, tampered_advisories
 from detection import Detector
 from sensor import Sensor
 
@@ -151,7 +152,12 @@ def print_limits(detector, sensors):
         print(f"{s.id:<8}{s.name:<32}{f'x{jump:.2f}':>8}{f'x{drift:.2f}':>8}")
 
 
-def print_attack_log(attacker):
+def plan_for(name):
+    """The attacks planned in config.py for --attack mixed or --attack coordinated."""
+    return config.COORDINATED_ATTACKS if name == "coordinated" else config.ATTACKS
+
+
+def print_attack_log(attacker, tampered):
     # Printed only at the end, so the daily tables look exactly as a defender would see them.
     print("\n" + "=" * 56)
     print("ATTACK LOG (ground truth)")
@@ -171,16 +177,26 @@ def print_attack_log(attacker):
                       f"when the readings showed {real_flow:.1f} ML/day, {real_change:+d}%")
         elif attack["type"] == "fake_source":
             detail = f"{first['sensor']} copied the real figures under an unapproved name"
+        elif attack["type"] == "stale_advisory":
+            start, end = advisory_period(attack)
+            detail = f"{first['sensor']} republished the genuine figures for {start} to {end} as current"
         elif attack["type"] == "spike":
             detail = f"real {first['real']:.2f} -> fake {first['fake']:.2f} ML/day"
-        elif attack["type"] == "drift":
+        elif attack["type"] in ("drift", "coordinated"):
             detail = f"{last['fake'] / last['real'] - 1:+.0%} off by the last day"
         else:
             detail = f"frozen at {first['fake']:.2f} ML/day for {len(entries)} days"
         print(f"{describe(attack)}: {detail}")
 
+    # Genuine notices built from tampered readings pass every advisory check, so they only show up here.
+    if tampered:
+        print("\nGenuine advisories that quoted tampered readings (the advisory check can't see these):")
+    for advisory, flow, change in tampered:
+        print(f"  {advisory['id']} said {advisory['avg_flow_ml']:.1f} ML/day, {advisory['change_pct']:+d}%; "
+              f"the real flow was {flow:.1f} ML/day, {change:+.0%}")
 
-def print_score(alerts, attacker):
+
+def print_score(alerts, attacker, tampered=()):
     caught, caught_late, missed, false_alarms = score(alerts, attacker)
     ran = len(caught) + len(caught_late) + len(missed)
 
@@ -191,6 +207,8 @@ def print_score(alerts, attacker):
     print(f"Caught late:     {len(caught_late)}  (only noticed when the attack stopped)")
     print(f"Attacks missed:  {len(missed)}")
     print(f"False alarms:    {len(false_alarms)}")
+    if tampered:
+        print(f"Advisories that quoted tampered readings: {len(tampered)}  (each passed the advisory check)")
 
     # Listing them by name shows exactly where a rule needs work.
     for attack in caught_late:
@@ -206,7 +224,8 @@ def main():
     parser = argparse.ArgumentParser(description="Replay daily streamflow for the five DWER gauges and check it.")
     parser.add_argument("--days", type=int, help="Only show this many days")
     parser.add_argument("--delay", type=float, default=0, help="Seconds to wait between days")
-    parser.add_argument("--attack", action="store_true", help="Apply the attacks planned in config.py")
+    parser.add_argument("--attack", nargs="?", const="mixed", choices=["mixed", "coordinated"],
+                        help="Apply the attacks planned in config.py: mixed (the default) or coordinated")
     args = parser.parse_args()
 
     # Caught here with a clear message, since 0 days would quietly show nothing and a negative pause would crash.
@@ -218,7 +237,7 @@ def main():
     sensors, dates = load_sensors()
 
     # Attacks are opt-in so a clean run is always available to compare against.
-    attacker = Attacker(config.ATTACKS if args.attack else [])
+    attacker = Attacker(plan_for(args.attack) if args.attack else [])
     detector = Detector()
     writer = AdvisoryWriter()
     all_alerts = []
@@ -237,10 +256,14 @@ def main():
         if args.delay:
             time.sleep(args.delay)
 
+    # The real readings are only used here, after the run, to show which genuine advisories the tampering corrupted.
+    real_by_date = {day: {s.id: s.read(day) for s in sensors} for day in shown_dates}
+    tampered = tampered_advisories(writer.published, real_by_date) if args.attack else []
+
     print_limits(detector, sensors)
     if args.attack:
-        print_attack_log(attacker)
-    print_score(all_alerts, attacker)
+        print_attack_log(attacker, tampered)
+    print_score(all_alerts, attacker, tampered)
 
 
 # Runs only when the file is executed directly rather than imported.

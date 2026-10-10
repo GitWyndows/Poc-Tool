@@ -112,3 +112,10 @@ def test_writer_quotes_the_readings_it_is_given():
 
     assert advisory is not None
     assert advisory["avg_flow_ml"] == round((7 * 115.0 + 500.0 - 23.0) / 7, 1)
+
+
+def test_writer_keeps_every_advisory_it_publishes():
+    writer = AdvisoryWriter()
+    for d, flows in {**week(start_day=1), **week(start_day=8)}.items():
+        writer.record(d, flows)
+    assert [a["id"] for a in writer.published] == ["ADV-01", "ADV-02"]

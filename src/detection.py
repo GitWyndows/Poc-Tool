@@ -1,6 +1,8 @@
-"""Detection rules for streamflow (sudden jumps, stuck gauges and slow drift, each judged against the other gauges)
-and for public advisories (unapproved sources and figures that don't match the readings)."""
+"""Detection rules for streamflow (sudden jumps, stuck gauges and slow drift, each judged against the other gauges,
+plus upstream and downstream gauges that stop agreeing) and for public advisories (unapproved sources, figures that
+don't match the readings, and weeks that are the wrong length, in the future or stale)."""
 import math
+from datetime import date as Date
 from statistics import median
 
 import config
@@ -44,6 +46,11 @@ class Detector:
         self.jump_limit = {}
         self.drift_limit = {}
 
+        # Each upstream and downstream pair's ratio while learning, the range it may stay in, and pairs already flagged.
+        self.learned_pair = {}
+        self.pair_range = {}
+        self.pair_alerted = set()
+
         # Every day's flows as seen, so an advisory's figures can be checked against them.
         self.readings_by_date = {}
 
@@ -67,8 +74,10 @@ class Detector:
 
         if learning:
             self._learn(changes)
+            self._learn_pairs(logs)
         else:
             alerts += self._check_changes(date, flows, changes)
+            alerts += self._check_pairs(date, flows, logs, {a["sensor"] for a in alerts})
 
         # While learning every value is trusted; after that, only gauges with no baseline start afresh.
         for sid, log in logs.items():
@@ -102,6 +111,43 @@ class Detector:
             # Headroom above the worst June day, since July and August will bring days a little rougher than any in June.
             self.jump_limit[sid] = config.JUMP_MARGIN * max(self.learned_jump[sid])
             self.drift_limit[sid] = config.DRIFT_MARGIN * max(self.learned_drift[sid])
+
+        # A pair's ratio may stray a little past the lowest and highest seen while learning.
+        margin = math.log(config.PAIR_MARGIN)
+        for pair, ratios in self.learned_pair.items():
+            self.pair_range[pair] = (min(ratios) - margin, max(ratios) + margin)
+
+    def _learn_pairs(self, logs):
+        # Ratios are kept as differences in logs, which is the same thing as dividing the flows.
+        for down, up in config.PAIRS:
+            if down in logs and up in logs:
+                self.learned_pair.setdefault((down, up), []).append(logs[down] - logs[up])
+
+    def _check_pairs(self, date, flows, logs, already_flagged):
+        alerts = []
+        for pair, (low, high) in self.pair_range.items():
+            down, up = pair
+            ratio = logs[down] - logs[up]
+
+            # Back in range means the pair can be flagged afresh if it strays again later.
+            if low <= ratio <= high:
+                self.pair_alerted.discard(pair)
+                continue
+
+            # One alert while the pair stays out of range, and none on a day another rule already flagged either gauge.
+            if pair in self.pair_alerted or down in already_flagged or up in already_flagged:
+                continue
+            self.pair_alerted.add(pair)
+
+            # A high ratio means the downstream gauge rose or the upstream one fell (and the reverse for a low one), so
+            # the blame goes to whichever has recently drifted from the other gauges in the direction that explains it.
+            push = {down: 1, up: -1} if ratio > high else {down: -1, up: 1}
+            culprit = max(pair, key=lambda sid: push[sid] * sum(self.gaps.get(sid, [])))
+            shown = f"{flows[down] / flows[up]:.2f}x" if flows[up] else "all"
+            alerts.append(self._alert(date, culprit, "pair", flows[culprit],
+                                      f"downstream {down} carries {shown} the flow of upstream {up}, outside the "
+                                      f"{math.exp(low):.2f}x to {math.exp(high):.2f}x expected from June"))
+        return alerts
 
     def _record(self, flows):
         # One extra day is kept so a run can be seen changing, not just sitting still.
@@ -145,8 +191,10 @@ class Detector:
     def _check_changes(self, date, flows, changes):
         alerts = []
 
-        # Gauges under watch are left out of everyone else's comparison, so a drifting gauge can't skew the median.
-        trusted = {sid: c for sid, c in changes.items() if sid not in self.drift_alerted}
+        # Gauges drifting or flagged for a jump are left out of everyone else's comparison, since their changes are
+        # measured from a value that can't be trusted and would skew the median.
+        untrusted = self.drift_alerted | self.jumped
+        trusted = {sid: c for sid, c in changes.items() if sid not in untrusted}
 
         for sid, change in changes.items():
             now = to_log(flows[sid])
@@ -210,6 +258,8 @@ class Detector:
         if advisory["source"] not in config.APPROVED_SOURCES:
             problems.append(f"source '{advisory['source']}' is not approved")
 
+        problems += self._check_period(advisory)
+
         # The figures are rebuilt from the flows the detector has seen, using the same maths as the writer.
         figures = weekly_figures(self.readings_by_date, advisory["period_start"], advisory["period_end"])
         if figures is None:
@@ -226,6 +276,25 @@ class Detector:
 
         # One alert per advisory, with every problem listed, so a notice that fails both checks isn't counted twice.
         return [self._alert(advisory["published"], advisory["id"], "advisory", advisory["source"], "; ".join(problems))]
+
+    @staticmethod
+    def _check_period(advisory):
+        """Return problems with the week an advisory describes, compared with when it was published."""
+        start, end = Date.fromisoformat(advisory["period_start"]), Date.fromisoformat(advisory["period_end"])
+        published = Date.fromisoformat(advisory["published"])
+        problems = []
+
+        # Every genuine notice covers exactly one week, so a longer or shorter one is stretching or hiding something.
+        days = (end - start).days + 1
+        if days != config.ADVISORY_EVERY_DAYS:
+            problems.append(f"covers {days} days instead of {config.ADVISORY_EVERY_DAYS}")
+
+        # A notice can't report days that haven't happened, and an old week passed off as current is just as misleading.
+        if end > published:
+            problems.append(f"describes days up to {advisory['period_end']}, after it was published")
+        elif (published - end).days > config.ADVISORY_MAX_AGE_DAYS:
+            problems.append(f"published {(published - end).days} days after its week ended")
+        return problems
 
     @staticmethod
     def _alert(date, sensor_id, rule, value, reason):

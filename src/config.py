@@ -35,6 +35,13 @@ DRIFT_DAYS = 10
 # That total is flagged when it's 1.5 times the biggest total seen while learning.
 DRIFT_MARGIN = 1.5
 
+# Gauge pairs on the same stream, as (downstream, upstream). The downstream gauge collects the upstream one's water,
+# so the ratio between them stays in a steady range, and a tampered gauge pushes it out of that range.
+PAIRS = [("607022", "607013")]
+
+# The ratio is flagged once it strays 10% past the lowest or highest ratio seen while learning.
+PAIR_MARGIN = 1.1
+
 # Advisories from any other source are treated as untrustworthy, however believable their figures.
 APPROVED_SOURCES = ["Water Corporation", "Bureau of Meteorology", "Department of Water and Environmental Regulation"]
 
@@ -45,9 +52,13 @@ ADVISORY_EVERY_DAYS = 7
 ADVISORY_FLOW_TOLERANCE_ML = 0.1
 ADVISORY_CHANGE_TOLERANCE_PCT = 1
 
+# A genuine advisory goes out the day its week ends, so one published more than a day later is stale.
+ADVISORY_MAX_AGE_DAYS = 1
+
 # Planned attacks, only used with --attack, all after learning so June stays clean. A spike multiplies one day's flow,
 # a flatline freezes a gauge, and drift adds the same percentage on top of the last each day. Fake figures pose as an
-# approved source with made-up numbers, while a fake source quotes the real numbers under a name that isn't approved.
+# approved source with made-up numbers, a fake source quotes the real numbers under a name that isn't approved, and a
+# stale advisory republishes an old week's genuine notice as if it were current.
 ATTACKS = [
     {"type": "spike", "sensor": "608171", "date": "2026-07-15", "factor": 3.0},
     {"type": "spike", "sensor": "607013", "date": "2026-08-05", "factor": 0.5},
@@ -57,4 +68,12 @@ ATTACKS = [
     {"type": "drift", "sensor": "608151", "start": "2026-07-27", "days": 14, "rate": 0.05},
     {"type": "fake_figures", "date": "2026-07-19", "source": "Water Corporation", "avg_flow_ml": 140.0, "change_pct": -65},
     {"type": "fake_source", "date": "2026-08-16", "source": "WA Water Watch"},
+    {"type": "stale_advisory", "date": "2026-08-30", "weeks_old": 2},
+]
+
+# A coordinated attack, only used with --attack coordinated. Both Lefroy Brook gauges are drifted up together, so
+# they agree with each other, and the agency's genuine advisories then quote the inflated flows. Every advisory check
+# passes, because the notices match the tampered readings, so only the gauge rules can catch it.
+COORDINATED_ATTACKS = [
+    {"type": "coordinated", "sensors": ["607022", "607013"], "start": "2026-07-20", "days": 21, "rate": 0.04},
 ]

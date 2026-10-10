@@ -291,3 +291,97 @@ def test_advisory_built_from_tampered_readings_passes():
 
     assert published is not None
     assert detector.check_advisory(published) == []
+
+
+# Reference period
+
+def test_advisory_covering_the_wrong_number_of_days_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    [alert] = detector.check_advisory(advisory(start="2026-07-02", end="2026-07-07"))
+    assert "covers 6 days instead of 7" in alert["reason"]
+
+
+def test_advisory_describing_days_after_it_was_published_is_flagged():
+    detector = Detector()
+    seen_week(detector)
+    early = make_advisory("ADV-01", "2026-07-05", "2026-07-01", "2026-07-07", "Water Corporation", 115.0, 0.30)
+    [alert] = detector.check_advisory(early)
+    assert alert["reason"] == "describes days up to 2026-07-07, after it was published"
+
+
+def test_old_week_passed_off_as_current_is_flagged():
+    # The figures are right for their week, so only the dates give a recycled notice away.
+    detector = Detector()
+    seen_week(detector)
+    stale = make_advisory("ADV-01", "2026-07-21", "2026-07-01", "2026-07-07", "Water Corporation", 115.0, 0.30)
+    [alert] = detector.check_advisory(stale)
+    assert alert["reason"] == "published 14 days after its week ended"
+
+
+def test_advisory_a_day_late_is_allowed():
+    detector = Detector()
+    seen_week(detector)
+    late = make_advisory("ADV-01", "2026-07-08", "2026-07-01", "2026-07-07", "Water Corporation", 115.0, 0.30)
+    assert detector.check_advisory(late) == []
+
+
+# Upstream and downstream pairs
+
+def calm(n, start=0):
+    """Days where every gauge carries the same flow, rising very slightly so no gauge ever looks stuck."""
+    return [day(round(100.0 + 0.01 * (start + i), 2)) for i in range(n)]
+
+
+@pytest.fixture
+def paired(monkeypatch):
+    """A detector that treats A as downstream of B, and has learned from a calm June and ten calm July days."""
+    monkeypatch.setattr(config, "PAIRS", [("A", "B")])
+    d = Detector()
+    run(d, learning_days(), start="2026-06-01")
+    run(d, calm(10))
+    return d
+
+
+def run_on(detector, days, start="2026-07-11"):
+    """Carry on from the paired fixture's last day."""
+    return run(detector, days, start)
+
+
+def apart(i):
+    """Day `i` after the fixture, with A up 14% and B down 10% on the others."""
+    flows = calm(1, start=10 + i)[0]
+    return {**flows, "A": round(flows["A"] * 1.14, 2), "B": round(flows["B"] * 0.90, 2)}
+
+
+def test_pair_pushed_out_of_range_blames_the_gauge_that_moved(paired):
+    # A rises 14% and B falls 10%: each change is inside the jump limit, but together they break the pair's ratio.
+    [alert] = run_on(paired, [apart(0)])
+
+    assert (alert["sensor"], alert["rule"]) == ("A", "pair")
+    assert alert["reason"].startswith("downstream A carries 1.27x the flow of upstream B, outside the")
+
+
+def test_pair_a_little_past_the_june_range_is_allowed(paired):
+    # June's ratio swung about 10% either way, so 5% each way (about 11% apart) is just past it but inside the margin.
+    flows = calm(1, start=10)[0]
+    nudged = {**flows, "A": round(flows["A"] * 1.05, 2), "B": round(flows["B"] * 0.95, 2)}
+    assert run_on(paired, [nudged]) == []
+
+
+def test_pair_is_flagged_once_until_it_returns_to_range(paired):
+    days = [apart(0), apart(1), apart(2)] + calm(2, start=13) + [apart(5)]
+    alerts = run_on(paired, days)
+    assert [a["date"] for a in alerts if a["rule"] == "pair"] == ["2026-07-11", "2026-07-16"]
+
+
+def test_pair_stays_quiet_when_another_rule_already_flagged_the_gauge(paired):
+    alerts = run_on(paired, [{**calm(1, start=10)[0], "A": 300.0}])
+    assert [a["rule"] for a in alerts] == ["jump"]
+
+
+def test_pair_stays_quiet_on_ordinary_days(monkeypatch):
+    monkeypatch.setattr(config, "PAIRS", [("A", "B")])
+    d = Detector()
+    run(d, learning_days(), start="2026-06-01")
+    assert run(d, learning_days()) == []

@@ -1,12 +1,12 @@
-"""Attacks on gauge readings (spikes, flatlines, drift) and on public advisories (fake figures, fake source),
-all logged so detection can be scored against them."""
+"""Attacks on gauge readings (spikes, flatlines, drift, coordinated drift) and on public advisories (fake figures,
+fake source, stale advisory), all logged so detection can be scored against them."""
 from datetime import date, timedelta
 
 import config
 from advisories import make_advisory, weekly_figures
 
-SENSOR_TYPES = ("spike", "flatline", "drift")
-ADVISORY_TYPES = ("fake_figures", "fake_source")
+SENSOR_TYPES = ("spike", "flatline", "drift", "coordinated")
+ADVISORY_TYPES = ("fake_figures", "fake_source", "stale_advisory")
 TYPES = SENSOR_TYPES + ADVISORY_TYPES
 
 # What each attack type must say, so a typo in config.py fails straight away instead of silently doing nothing.
@@ -14,19 +14,28 @@ NEEDED = {
     "spike": ["sensor", "date", "factor"],
     "flatline": ["sensor", "start", "days"],
     "drift": ["sensor", "start", "days", "rate"],
+    "coordinated": ["sensors", "start", "days", "rate"],
     "fake_figures": ["date", "source", "avg_flow_ml", "change_pct"],
     "fake_source": ["date", "source"],
+    "stale_advisory": ["date", "weeks_old"],
 }
 
 
 def attack_dates(attack):
     """Return every date an attack covers, as "YYYY-MM-DD" strings."""
-    # Spikes and fake advisories each happen on a single day.
+    # Spikes and advisory attacks each happen on a single day.
     if "date" in attack:
         return [attack["date"]]
 
     start = date.fromisoformat(attack["start"])
     return [(start + timedelta(days=i)).isoformat() for i in range(attack["days"])]
+
+
+def attacked_sensors(attack):
+    """The gauges an attack tampers with, which is several for a coordinated drift and none for an advisory."""
+    if attack["type"] == "coordinated":
+        return list(attack["sensors"])
+    return [attack["sensor"]] if attack["type"] in SENSOR_TYPES else []
 
 
 def day_after(attack):
@@ -43,16 +52,21 @@ def describe(attack):
         return f"fake figures posing as {attack['source']} on {attack['date']}"
     if attack["type"] == "fake_source":
         return f"fake advisory from '{attack['source']}' on {attack['date']}"
+    if attack["type"] == "stale_advisory":
+        return f"stale advisory reusing a week from {attack['weeks_old']} weeks earlier on {attack['date']}"
 
     dates = attack_dates(attack)
     if attack["type"] == "drift":
         return f"drift on {attack['sensor']} of {attack['rate']:+.0%} a day from {dates[0]} to {dates[-1]}"
+    if attack["type"] == "coordinated":
+        return (f"coordinated drift on {', '.join(attack['sensors'])} of {attack['rate']:+.0%} a day "
+                f"from {dates[0]} to {dates[-1]}")
     return f"flatline on {attack['sensor']} from {dates[0]} to {dates[-1]}"
 
 
 def advisory_period(attack):
-    """The week a fake advisory claims to describe, ending on the day it goes out, just like a genuine one."""
-    end = date.fromisoformat(attack["date"])
+    """The week an advisory attack claims to describe, ending on the day it goes out unless it's a stale one."""
+    end = date.fromisoformat(attack["date"]) - timedelta(weeks=attack.get("weeks_old", 0))
     start = end - timedelta(days=config.ADVISORY_EVERY_DAYS - 1)
     return start.isoformat(), end.isoformat()
 
@@ -66,12 +80,20 @@ def check_attack(attack):
         if key not in attack:
             raise ValueError(f"{attack['type']} attack is missing '{key}'.")
 
-    if attack["type"] in SENSOR_TYPES and attack["sensor"] not in {sid for sid, _ in config.SENSORS}:
-        raise ValueError(f"{describe(attack)}: '{attack['sensor']}' is not one of the gauges in config.py.")
+    known = {sid for sid, _ in config.SENSORS}
+    if attack["type"] == "coordinated" and len(set(attack["sensors"])) < 2:
+        raise ValueError(f"{describe(attack)}: a coordinated drift needs at least two different gauges.")
+    for sid in attacked_sensors(attack):
+        if sid not in known:
+            raise ValueError(f"{describe(attack)}: '{sid}' is not one of the gauges in config.py.")
 
     # An approved source with real figures would just be a genuine advisory, so this type needs an unapproved one.
     if attack["type"] == "fake_source" and attack["source"] in config.APPROVED_SOURCES:
         raise ValueError(f"{describe(attack)}: '{attack['source']}' is an approved source.")
+
+    # A stale advisory can only reuse a week the readings cover.
+    if attack["type"] == "stale_advisory" and advisory_period(attack)[0] < config.START_DATE:
+        raise ValueError(f"{describe(attack)}: the week it reuses starts before {config.START_DATE}.")
 
     # An attack during learning would be learned as normal, widening the limits instead of testing them.
     dates = attack_dates(attack)
@@ -89,15 +111,16 @@ class Attacker:
         # Sensor attacks are keyed by (gauge, date), so each reading needs only one lookup to find its attacks.
         self.targets = {}
 
-        # Fake advisories are keyed by the date they go out.
+        # Advisory attacks are keyed by the date they go out.
         self.advisory_targets = {}
 
         for attack_id, attack in enumerate(plan):
             if attack["type"] in ADVISORY_TYPES:
                 self.advisory_targets.setdefault(attack["date"], []).append(attack_id)
                 continue
-            for d in attack_dates(attack):
-                self.targets.setdefault((attack["sensor"], d), []).append(attack_id)
+            for sid in attacked_sensors(attack):
+                for d in attack_dates(attack):
+                    self.targets.setdefault((sid, d), []).append(attack_id)
 
         # The value a flatline repeats, captured from the real reading on its first day.
         self.frozen = {}
@@ -105,7 +128,7 @@ class Attacker:
         # Numbers the fake advisories as ADV-F1, ADV-F2 and so on, only so the score can tell them apart.
         self.fake_count = 0
 
-        # The ground truth: what was changed, kept separate so detection can later be marked against it.
+        # The ground truth (what was changed, kept separate so detection can later be marked against it).
         self.log = []
 
     def apply(self, sensor_id, date, flow):
@@ -116,7 +139,7 @@ class Attacker:
 
             if attack["type"] == "spike":
                 flow = round(real * attack["factor"], 2)
-            elif attack["type"] == "drift":
+            elif attack["type"] in ("drift", "coordinated"):
                 # Each day adds the same percentage on top of the last, so no single day looks unusual.
                 day_number = attack_dates(attack).index(date) + 1
                 flow = round(real * (1 + attack["rate"]) ** day_number, 2)
@@ -135,16 +158,18 @@ class Attacker:
             attack = self.plan[attack_id]
             start, end = advisory_period(attack)
 
-            # What an honest advisory for that week would have said, kept for the log.
+            # The figures for the week the advisory names, which a fake source or a stale notice quotes as they are.
             real = weekly_figures(readings_by_date, start, end)
             if real is None:
                 continue
 
-            # Copying the real figures means the numbers hold up, leaving only the source to give it away.
             figures = (attack["avg_flow_ml"], attack["change_pct"] / 100) if attack["type"] == "fake_figures" else real
 
+            # A stale notice reuses a genuine old week under the genuine source, so only its dates give it away.
+            source = attack.get("source", config.APPROVED_SOURCES[0])
+
             self.fake_count += 1
-            advisory = make_advisory(f"ADV-F{self.fake_count}", date, start, end, attack["source"], *figures)
+            advisory = make_advisory(f"ADV-F{self.fake_count}", date, start, end, source, *figures)
             fakes.append(advisory)
 
             # Advisories have no gauge, so the advisory's ID takes that slot and scoring treats it like any other attack.
@@ -152,6 +177,24 @@ class Attacker:
                              "real": (round(real[0], 1), round(real[1] * 100)),
                              "fake": (advisory["avg_flow_ml"], advisory["change_pct"])})
         return fakes
+
+
+def tampered_advisories(advisories, real_by_date):
+    """Return (advisory, real flow, real change) for each advisory whose figures only hold because readings were tampered.
+
+    These are the genuine notices in a coordinated attack: they match the readings the agency saw, so the advisory
+    check passes, but they don't match what the rivers really did.
+    """
+    tampered = []
+    for advisory in advisories:
+        real = weekly_figures(real_by_date, advisory["period_start"], advisory["period_end"])
+        if real is None:
+            continue
+        flow, change = real
+        if (abs(advisory["avg_flow_ml"] - flow) > config.ADVISORY_FLOW_TOLERANCE_ML
+                or abs(advisory["change_pct"] - change * 100) > config.ADVISORY_CHANGE_TOLERANCE_PCT):
+            tampered.append((advisory, flow, change))
+    return tampered
 
 
 def score(alerts, attacker):

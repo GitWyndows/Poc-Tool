@@ -257,10 +257,36 @@ def test_attack_run_logs_and_scores_the_planned_attacks(monkeypatch, capsys):
     assert "spike on 608171 of x3.0 on 2026-07-15: real 33.32 -> fake 99.96 ML/day" in out
     assert "ADV-F1 claimed 140.0 ML/day, -65% when the readings showed 380.2 ML/day, -24%" in out
     assert "ADV-F2 copied the real figures under an unapproved name" in out
-    assert "Attacks caught:  6 of 8" in out
+    assert "ADV-F3 republished the genuine figures for 2026-08-10 to 2026-08-16 as current" in out
+    assert "ALERT ADV-F3 advisory: published 14 days after its week ended" in out
+    assert "Attacks caught:  7 of 9" in out
     assert "LATE         drift on 608151" in out
     assert "MISSED       spike on 608002 of x1.5" in out
     assert "False alarms:    0" in out
+
+    # The sensor attacks also leak into the agency's own advisories, which pass every advisory check.
+    assert "ADV-12 said 693.6 ML/day, -32%; the real flow was 461.8 ML/day, -4%" in out
+    assert "Advisories that quoted tampered readings: 6" in out
+
+
+def test_coordinated_run_shows_genuine_advisories_quoting_the_drift(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--attack", "coordinated"])
+    main.main()
+    out = capsys.readouterr().out
+
+    # Both Lefroy gauges drift together, so they agree with each other and the drift only shows when it stops.
+    assert "coordinated drift on 607022, 607013 of +4% a day from 2026-07-20 to 2026-08-09" in out
+    assert "ADV-10 said 475.4 ML/day, +147%; the real flow was 327.0 ML/day, +111%" in out
+    assert "Advisories that quoted tampered readings: 3" in out
+    assert "Caught late:     1" in out
+    assert "False alarms:    0" in out
+
+
+def test_unknown_attack_plan_name_is_refused(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--attack", "everything"])
+    with pytest.raises(SystemExit):
+        main.main()
+    assert "invalid choice: 'everything'" in capsys.readouterr().err
 
 
 def test_attacks_after_the_days_shown_are_reported_as_skipped(monkeypatch, capsys):

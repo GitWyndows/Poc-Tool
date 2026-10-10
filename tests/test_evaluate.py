@@ -69,11 +69,30 @@ def test_fake_figures_understate_the_real_week(data):
     assert attack["source"] in config.APPROVED_SOURCES
 
 
-def test_clean_replay_has_no_false_alarms(data):
+def test_clean_replay_has_no_false_alarms_or_bad_advisories(data):
     sensors, dates = data
-    (caught, late, missed, false_alarms), advisories = evaluate.replay(sensors, dates, [])
+    clean = {day: {s.id: s.read(day) for s in sensors} for day in dates}
+    (caught, late, missed, false_alarms), advisories, tampered = evaluate.replay(sensors, dates, [], clean)
     assert (caught, late, missed, false_alarms) == ([], [], [], [])
-    assert advisories == 13
+    assert (advisories, tampered) == (13, 0)
+
+
+def test_drifting_every_gauge_together_is_never_caught(data):
+    # With every gauge in on it there's nothing honest left to compare against, which is this method's hard limit.
+    rows = run(data, "coordinated, all 5 gauges +10% a day, 14 days")
+    t = rows["coordinated, all 5 gauges +10% a day, 14 days"]
+
+    assert t["runs"] == 49
+    assert t["missed"] == t["runs"]
+    assert t["tampered"] > 0
+
+
+def test_gauge_attacks_corrupt_advisories_and_advisory_attacks_dont(data):
+    rows = run(data, "drift +5% a day, 14 days", "stale advisory, 2 weeks old")
+
+    assert rows["drift +5% a day, 14 days"]["tampered"] > 0
+    assert rows["stale advisory, 2 weeks old"]["tampered"] == 0
+    assert rows["stale advisory, 2 weeks old"]["caught"] == rows["stale advisory, 2 weeks old"]["runs"]
 
 
 def test_main_prints_the_clean_line_and_a_row_per_scenario(monkeypatch, capsys):
